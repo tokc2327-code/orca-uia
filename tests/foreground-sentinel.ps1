@@ -60,11 +60,11 @@ public sealed class ForegroundSentinel : IDisposable
     private readonly HashSet<int> _watchPids;
     private readonly List<Violation> _violations = new();
     private readonly ManualResetEventSlim _ready = new(false);
-    private Thread? _thread;
+    private Thread _thread;
     private uint _threadId;
-    private WinEventDelegate? _callback; // 必须强引用，防 GC 回收回调导致崩溃
+    private WinEventDelegate _callback; // 必须强引用，防 GC 回收回调导致崩溃
 
-    public ForegroundSentinel(int[]? watchPids)
+    public ForegroundSentinel(int[] watchPids)
     {
         _baselineFg = GetForegroundWindow();
         _watchPids = new HashSet<int>(watchPids ?? Array.Empty<int>());
@@ -167,13 +167,14 @@ public sealed class ForegroundSentinel : IDisposable
     public void Dispose()
     {
         if (_threadId != 0) PostThreadMessage(_threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-        _thread?.Join(2000);
+        if (_thread != null) _thread.Join(2000);
         _ready.Dispose();
     }
 }
-"@ -ReferencedAssemblies "System.Text.Json"
+"@
 
 $sentinel = [ForegroundSentinel]::new($WatchPids)
+if ($null -eq $sentinel) { Write-Error '[sentinel] could not construct ForegroundSentinel - the C# did not compile'; exit 2 }
 $sentinel.Start()
 Write-Host "[sentinel] baseline foreground = 0x$($sentinel.BaselineForeground.ToString('X'))"
 
