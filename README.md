@@ -63,12 +63,35 @@ $env:ORCA_UIA_EXE = 'D:/orca-uia/src/bin/Release/net8.0-windows/orca-uia.exe'
 node clients/uia-driver.cjs job.json
 ```
 
+## Running a job without stealing the screen
+
+Driving a real app means the app comes to the front. On a machine someone is using, that costs
+them their typing and pollutes their screenshots, so a run should give the screen back:
+
+1. **Ask first.** A scripted run takes seconds and moves focus; start it when the machine is free.
+2. **Minimise what you launch.** `Start-Process notepad -WindowStyle Minimized`, or launch and move
+   focus back before attaching. A UWP app can ignore the flag — it should be closed afterwards.
+3. **Let the driver clean up.** Two job-level options:
+
+```json
+{ "title": "…",
+  "restore_foreground": "SomeApp",
+  "kill_on_exit": "CalculatorApp",
+  "steps": [ … ] }
+```
+
+`restore_foreground` (or `ORCA_UIA_FOREGROUND` in the environment) re-focusses the window whose
+title contains that string when the run ends; `kill_on_exit` closes the app the job drove — give a
+process name, or `true` to use the process the attach reply names. Both print what they did
+(`FOREGROUND …`, `KILL …`), so a run that fails mid-way still leaves the desktop as it found it.
+
 ## Known limits
 
 - **Snapshot ids are single-use.** After any action the id may be gone: re-snapshot, or use a live
   target (`{type, name, name_contains, aid}`), which is re-resolved each call.
-- **Packaged/UWP apps** (Windows Calculator, Settings) don't answer `app_attach` by title — use
-  `pid`. The pid changes on every launch.
+- **Packaged/UWP apps** (Windows Calculator, Settings) put their UI in a child process; attaching
+  by title lands on the `ApplicationFrameWindow` and can return an empty tree — use `pid` then. The
+  pid changes on every launch.
 - **Electron/Chromium** only builds its accessibility tree when asked: expect `app_warmup`, and add
   `--force-renderer-accessibility` for hosts that don't do it on their own.
 - **Elevated windows** can't be driven from a non-elevated process: UIA is blocked by UIPI, and the

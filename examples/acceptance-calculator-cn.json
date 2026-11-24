@@ -1,5 +1,6 @@
 {
   "title": "计算器",
+  "kill_on_exit": "CalculatorApp",
   "steps": [
     { "tool": "app_act", "args": { "steps": [ { "action": "click", "aid": "clearButton" } ] }, "expect": "# steps ok=", "reject": "\"ok\":false", "note": "先把上次留下的值清掉" },
     { "tool": "app_snapshot", "args": { "interactive_only": false, "max_nodes": 14 }, "expect": "显示为 0", "note": "基线：显示为 0" },
