@@ -1,0 +1,202 @@
+// 在 Engine 类中新增：前景策略检查（默认 forbid）
+static void AssertForegroundAllowed(JsonObject a, string op)
+{
+    var policy = a["foreground_policy"]?.GetValue<string>() ?? "forbid";
+    switch (policy)
+    {
+        case "allow":
+            return;
+        case "allow_on_idle":
+        {
+            uint reqIdle = (uint)(a["idle_ms"]?.GetValue<int>() ?? 3000);
+            uint actualIdle = NativeWin.GetIdleMs();
+            if (actualIdle >= reqIdle) return;
+            throw new ToolError(
+                "USER_ACTIVE",
+                $"{op} requires foreground, but user was active {actualIdle}ms ago (need >= {reqIdle}ms idle)",
+                "wait for user idle, switch to CDP/UIA pattern, or pass foreground_policy:\"allow\"");
+        }
+        case "forbid":
+            throw new ToolError(
+                "FOREGROUND_FORBIDDEN",
+                $"{op} would steal foreground/focus, blocked by foreground_policy:\"forbid\"",
+                "use UIA pattern or app_cdp instead, or explicitly pass foreground_policy:\"allow_on_idle\"|\"allow\"");
+        default:
+            throw new ToolError("BAD_ARGS", $"invalid foreground_policy '{policy}'", "use forbid|allow_on_idle|allow");
+    }
+}
+
+// 替换 Launch()：改用 CreateProcessW + SW_SHOWNOACTIVATE，拿到窗口后立即沉底
+string Launch(JsonObject a)
+{
+    var path = a["path"]?.GetValue<string>() ?? throw new ToolError("BAD_ARGS", "path required");
+    var args = a["args"]?.GetValue<string>() ?? "";
+    var force = a["force_accessibility"]?.GetValue<bool>() ?? LooksLikeChromium(path);
+    if (force && !args.Contains("--force-renderer-accessibility", StringComparison.OrdinalIgnoreCase))
+        args += " --force-renderer-accessibility";
+
+    // Electron/Chromium 单实例会激活已有进程，建议调用方对 Electron 同时传 --user-data-dir 与 --remote-debugging-port
+    var cmdLine = new StringBuilder($"\"{path}\" {args.Trim()}".Trim());
+    var si = new NativeWin.STARTUPINFO
+    {
+        cb = Marshal.SizeOf<NativeWin.STARTUPINFO>(),
+        dwFlags = NativeWin.STARTF_USESHOWWINDOW,
+        wShowWindow = NativeWin.SW_SHOWNOACTIVATE
+    };
+    if (!NativeWin.CreateProcessW(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref si, out var pi))
+        throw new ToolError("LAUNCH_FAILED", $"CreateProcessW failed (win32={Marshal.GetLastWin32Error()})");
+
+    int launcherPid = pi.dwProcessId;
+    NativeWin.CloseHandle(pi.hThread);
+    NativeWin.CloseHandle(pi.hProcess);
+
+    var title = a["title_contains"]?.GetValue<string>();
+    var deadline = DateTime.UtcNow.AddMilliseconds(a["timeout_ms"]?.GetValue<int>() ?? 30000);
+    while (DateTime.UtcNow < deadline)
+    {
+        var w = FindWindow(title == null ? launcherPid : null, title);
+        if (w != null)
+        {
+            win = w; recipes.Clear();
+            // 立刻无激活沉底，压制创建期置顶
+            try { NativeWin.SendToBackNoActivate(w.Properties.NativeWindowHandle.ValueOrDefault); } catch { }
+            int ownerPid; string? ownerName;
+            try { ownerPid = w.Properties.ProcessId.ValueOrDefault; ownerName = w.Properties.Name.ValueOrDefault; }
+            catch { ownerPid = launcherPid; ownerName = null; }
+            int preloaded = Preload(a["preload_ms"]?.GetValue<int>() ?? 1500);
+            return Json(new { launched = true, pid = ownerPid, launcher_pid = launcherPid, window = ownerName, nodes = preloaded });
+        }
+        bool exited = false;
+        try { using var p = Process.GetProcessById(launcherPid); exited = p.HasExited; } catch { exited = true; }
+        if (title == null && exited)
+            throw new ToolError("LAUNCH_HANDED_OFF", "launcher exited before a window appeared",
+                "the app was handed off to an existing process or is a UWP package; retry with title_contains, or pass --user-data-dir for Electron");
+        Thread.Sleep(250);
+    }
+    throw new ToolError("WINDOW_TIMEOUT", "no window appeared", "pass title_contains if the launcher spawns another process");
+}
+
+// 替换 Window() 中 show / hide / focus 分支：show 改为无激活沉底，focus 受策略门禁
+if (action == "show")
+{
+    NativeWin.SendToBackNoActivate(best.H);
+}
+else if (action == "hide")
+{
+    NativeWin.ShowWindow(best.H, NativeWin.SW_HIDE);
+}
+else if (action == "focus")
+{
+    AssertForegroundAllowed(a, "app_window.focus");
+    NativeWin.ShowWindow(best.H, 9 /* SW_RESTORE */);
+    NativeWin.SetForegroundWindow(best.H);
+}
+else throw new ToolError("BAD_ARGS", "action must be list|show|hide|focus");
+
+// 替换 Shot() 截屏段：禁止 CopyFromScreen 回退，最小化/失败直接报错
+if (NativeWin.IsIconic(hit.H))
+    throw new ToolError("WINDOW_MINIMIZED", "minimized windows stop DWM composition and cannot be captured",
+        "call app_window with action:\"show\" (non-activating) first");
+
+using var bmp = new Bitmap(w2, h2);
+using (var g = Graphics.FromImage(bmp))
+{
+    IntPtr hdc = g.GetHdc();
+    bool ok;
+    try { ok = NativeWin.PrintWindow(hit.H, hdc, 2 /* PW_RENDERFULLCONTENT */); }
+    finally { g.ReleaseHdc(hdc); }
+    if (!ok)
+        throw new ToolError("SHOT_PRINTWINDOW_FAILED",
+            "PrintWindow(PW_RENDERFULLCONTENT) failed; refusing to fall back to CopyFromScreen to avoid capturing foreground user content",
+            "ensure the window is not minimized; for hardware-accelerated surfaces, upgrade to Windows.Graphics.Capture");
+}
+
+// 替换 RunAction()：去掉所有非物理 el.Focus()，物理操作统一过 AssertForegroundAllowed
+static string RunAction(AutomationElement el, string action, string? text, string input, JsonObject policyArgs)
+{
+    bool physical = string.Equals(input, "physical", StringComparison.OrdinalIgnoreCase);
+    switch (action)
+    {
+        case "click":
+            bool scrolled = false;
+            try
+            {
+                if (el.Properties.IsOffscreen.ValueOrDefault && el.Patterns.ScrollItem.IsSupported)
+                {
+                    el.Patterns.ScrollItem.Pattern.ScrollIntoView();
+                    scrolled = true;
+                    Thread.Sleep(150);
+                }
+            }
+            catch { }
+            var pre = scrolled ? "scroll+" : "";
+            if (el.Patterns.Invoke.IsSupported) { el.Patterns.Invoke.Pattern.Invoke(); return pre + "invoke"; }
+            if (el.Patterns.Toggle.IsSupported) { el.Patterns.Toggle.Pattern.Toggle(); return pre + "toggle"; }
+            if (el.Patterns.SelectionItem.IsSupported) { el.Patterns.SelectionItem.Pattern.Select(); return pre + "selection"; }
+            if (el.Patterns.ExpandCollapse.IsSupported) { el.Patterns.ExpandCollapse.Pattern.Expand(); return pre + "expand"; }
+            if (!physical)
+                throw new ToolError("NO_BACKGROUND_PATTERN",
+                    "element supports none of Invoke/Toggle/SelectionItem/ExpandCollapse; refusing to call Focus()",
+                    "for Electron use app_cdp action:\"click\"; otherwise pass input:\"physical\" with an explicit foreground_policy");
+            AssertForegroundAllowed(policyArgs, "app_act.click(physical)");
+            el.Click();
+            return pre + "physical";
+
+        case "set_value":
+            if (text == null) throw new ToolError("BAD_ARGS", "text required");
+            if (el.Patterns.Value.IsSupported && !el.Patterns.Value.Pattern.IsReadOnly.ValueOrDefault)
+            {
+                el.Patterns.Value.Pattern.SetValue(text);
+                bool pwRead = false;
+                try { pwRead = el.Properties.IsPassword.ValueOrDefault; } catch { }
+                var read = el.Patterns.Value.Pattern.Value.ValueOrDefault;
+                if (pwRead || read == text) return "value";
+                if (TryNativeText(el, text, append: false, out var nv)) return nv;
+                return "value_ignored";
+            }
+            if (TryNativeText(el, text, append: false, out var nu)) return nu;
+            throw new ToolError("NO_VALUE_PATTERN", "element has no writable Value pattern",
+                "for Electron contenteditable use app_cdp action:\"insert_text\"");
+
+        case "type":
+            if (text == null) throw new ToolError("BAD_ARGS", "text required");
+            if (physical)
+            {
+                AssertForegroundAllowed(policyArgs, "app_act.type(physical)");
+                el.Click(); // 仅在策略显式放行后通过点击落焦，不再私自调用 el.Focus()
+                Keyboard.Type(text);
+                return "physical";
+            }
+            if (el.Patterns.Value.IsSupported && !el.Patterns.Value.Pattern.IsReadOnly.ValueOrDefault)
+            {
+                bool pw = false;
+                try { pw = el.Properties.IsPassword.ValueOrDefault; } catch { }
+                if (pw) throw new ToolError("PASSWORD_FIELD", "password inputs cannot be appended without real keystrokes", "use action=set_value");
+                var cur = el.Patterns.Value.Pattern.Value.ValueOrDefault ?? "";
+                el.Patterns.Value.Pattern.SetValue(cur + text);
+                if (el.Patterns.Value.Pattern.Value.ValueOrDefault != cur + text && TryNativeText(el, text, append: true, out var nv))
+                    return nv;
+                return "value_append";
+            }
+            if (TryNativeText(el, text, append: true, out var na)) return na;
+            throw new ToolError("NO_PATTERN_TYPING", "element has no writable Value pattern",
+                "for Electron use app_cdp action:\"insert_text\"; or pass input:\"physical\" with foreground_policy");
+
+        case "press":
+            if (text == null || !Enum.TryParse<VirtualKeyShort>(text, true, out var key))
+                throw new ToolError("BAD_ARGS", "text must be a VirtualKeyShort name, e.g. ENTER, TAB, ESCAPE");
+            if (!physical) throw new ToolError("PHYSICAL_ONLY", "a key press is real input", "for Electron use app_cdp action:\"key\"");
+            AssertForegroundAllowed(policyArgs, "app_act.press(physical)");
+            el.Click();
+            Keyboard.Type(key);
+            return "physical";
+
+        case "toggle":
+            if (el.Patterns.Toggle.IsSupported) { el.Patterns.Toggle.Pattern.Toggle(); return "toggle"; }
+            if (el.Patterns.SelectionItem.IsSupported) { el.Patterns.SelectionItem.Pattern.Select(); return "selection"; }
+            throw new ToolError("NO_TOGGLE", "element supports neither Toggle nor SelectionItem");
+
+        default:
+            throw new ToolError("BAD_ARGS", "action must be click|set_value|type|press|toggle");
+    }
+}
