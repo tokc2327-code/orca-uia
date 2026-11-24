@@ -1,77 +1,131 @@
+> Part of the **Visual Collaboration** ecosystem — structured visual context and verifiable human-agent collaboration.
+
 # orca-uia
 
-**A stdio MCP server that lets an agent drive Windows desktop apps through UI Automation 3.**
+**0.5.0**
 
-Not screen-scraping, not pixel coordinates: it walks the UIA control tree, addresses elements by
-type/name/AutomationId, and acts through UIA patterns by default — no mouse, no keyboard, and the
-target is re-resolved against the live tree before every action, so a stale step can never click
-the wrong thing.
+**Pattern-first, zero-mouse Windows UI Automation MCP server for AI agents.**
 
-- **Windows only** (.NET 8, `net8.0-windows`, FlaUI 5.0.0 / UIA3).
-- **No MCP SDK dependency** — JSON-RPC 2.0, newline-delimited, over stdin/stdout.
-- **Snapshot-scoped ids**: `app_snapshot` returns `e1, e2, …`; ids die on the next snapshot on purpose.
+Operate Win32, WPF, Electron, and UWP desktop apps via structured control trees and UIA patterns — without hijacking your cursor, stealing your keyboard, or burning tokens on repeated screenshots.
 
-## Why
+[![.NET 8](https://img.shields.io/badge/.NET-8.0%20Windows-512BD4.svg)](#quick-start)
+[![UIA3](https://img.shields.io/badge/Windows-UIA3%20%2F%20FlaUI%205.0-0078D6.svg)](#architecture--known-boundaries)
+[![Protocol](https://img.shields.io/badge/MCP-stdio%20JSON--RPC%202.0-brightgreen.svg)](#tools-9)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
 
-Driving a real desktop app from an agent usually means one of: byte-sized screenshots (slow, blind
-to structure), blind coordinate clicks (brittle), or an app-specific automation API (doesn't scale).
-UIA gives you structure and semantics for every native, WPF, WinForms, Electron and Chromium app on
-Windows — this server just makes it addressable over MCP, with the failure modes named.
+---
 
-## Tools
+## Why orca-uia?
 
-| Tool | What it does |
-| --- | --- |
-| `app_launch` | Start an exe and attach to its main window. Adds `--force-renderer-accessibility` for known Electron/Chromium hosts only. |
-| `app_attach` | Attach to a running window by title substring or pid, preloading the tree (Electron builds it lazily). |
-| `app_warmup` | Poll node count until it settles — the usual fix for an empty Electron tree. |
-| `app_window` | List / show / hide / focus top-level windows, including hidden and tray windows (UIA can't see those, the HWND is still there). |
-| `app_snapshot` | The control tree as text, with snapshot-scoped ids and per-node state (`[on]` / `[off]` / `[selected]` / `[expanded]` / `(disabled)`). |
-| `app_act` | Click / set_value / type / press / toggle by snapshot id **or** live target, single step or `steps[]` sequence. Reports post-state and what appeared/vanished, so you don't need a screenshot between steps. |
-| `app_wait` | Wait until an element whose name contains a substring appears or disappears. |
-| `app_shot` | PNG of one window (`PrintWindow`, screen-copy fallback) for vision-capable clients. |
-| `app_cdp` | Escape hatch for Chromium/Electron contenteditable: talks to the renderer's DevTools protocol when UIA has no Value pattern and no HWND (needs `--remote-debugging-port`). |
+Most desktop agents rely on screenshot-and-click loops that break on window movement, burn vision tokens, and lock the user out of their own mouse and keyboard. **orca-uia** is built around five engineering rules:
 
-`app_act` takes `input: "pattern"` (default — UIA patterns only) or `"physical"` (real mouse and
-keyboard) when an app only reacts to real input.
+- **Zero Mouse / Keyboard by Default (`input: "pattern"`):** Clicks use UIA Patterns (`Invoke`, `Toggle`, `SelectionItem`, `ExpandCollapse`) and text entry uses `ValuePattern` or Win32 `WM_SETTEXT` / `EM_REPLACESEL`. Real OS input (`input: "physical"`) is strictly opt-in.
+- **Strict Re-Resolution (Never Guess):** Snapshot IDs (`e1`, `e2`...) are snapshot-scoped recipes, never stale COM handles. Every action re-resolves strictly: `0` matches throws `NOT_FOUND`, `>1` throws `AMBIGUOUS_MATCH`.
+- **Multi-Step Execution with Diff Verification (`Execute → Verify`):** Pass `steps[]` with live selectors (`type`, `name`, `name_contains`, `aid`, `anchor`) to execute an entire workflow in **one MCP call**. Every step returns post-state and a control-tree diff (`added` / `removed` / `enabled_changed`), eliminating blind sleeps and intermediate screenshots.
+- **Built for Real-World Windows Quirks:** Ships with Chromium/Electron accessibility tree preloading, a built-in CDP bridge (`app_cdp`) for `contenteditable` editors, and Win32 `HWND` window management (`app_window`) for hidden/tray windows that UIA cannot see.
+- **Zero MCP SDK Bloat:** Single C# / .NET 8 executable running a dedicated STA thread with a Win32 message pump over newline-delimited stdio JSON-RPC 2.0.
 
-## Build
+---
+
+## Supported Surfaces
+
+| Surface | Examples | Primary Control Path | Notes |
+| --- | --- | --- | --- |
+| **Electron / Chromium** | DeepSeek Harness, VS Code, Cursor | UIA3 (`--force-renderer-accessibility`) + `app_cdp` | Use `--remote-debugging-port` for `contenteditable` typing & DOM clicks |
+| **Win32 / WPF** | Notepad, native desktop tools | UIA3 Patterns + `WM_SETTEXT` / `EM_REPLACESEL` | Best background compatibility; hidden/tray windows reachable via `app_window` |
+| **UWP / Packaged** | Windows Calculator, Settings | UIA3 Patterns | Attach by `pid` or `title_contains` (`ApplicationFrameHost` boundary) |
+
+---
+
+## Quick Start
+
+### 1. Prerequisites
+
+- Windows 10 version 1809 or later, x64.
+- **Nothing else** if you use the published build: `dist/win-x64/orca-uia.exe` is a self-contained single file and does not need a .NET runtime installed.
+- Only to build from source: [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+
+### 2. Get the executable
+
+From a checkout of this repo:
 
 ```powershell
-dotnet build src/OrcaUia.csproj -c Release
-# -> src/bin/Release/net8.0-windows/orca-uia.exe
+dotnet publish src/OrcaUia.csproj -c Release -r win-x64
+# -> dist/win-x64/orca-uia.exe
 ```
 
-## Wire it into an MCP client
+Note the project file lives in `src/`, not at the repo root. Git keeps the output directory via `dist/.gitkeep`; the executable itself is a local build artifact.
+
+Move that one file anywhere and point your MCP client at it — no install step.
+
+### 3. Add to your MCP client
+
+Register the executable as a stdio MCP server:
 
 ```json
 {
   "mcpServers": {
-    "uia": { "command": "D:/orca-uia/src/bin/Release/net8.0-windows/orca-uia.exe", "args": [] }
+    "orca-uia": {
+      "command": "D:/orca-uia/dist/win-x64/orca-uia.exe",
+      "args": []
+    }
   }
 }
 ```
 
-`examples/cordis.patch.example.yml` is the same thing for the DeepSeek Harness bundle format.
+- `examples/cordis.patch.example.yml` is the same thing for the DeepSeek Harness bundle format.
+- `clients/uia-driver.cjs` is a tiny scripted driver for testing without an agent: give it a JSON job (`{ "title": "window title", "steps": [{ "tool": "app_snapshot", "args": {} }] }`), it spawns the server, runs the steps and prints the receipts. Point it at your build with `ORCA_UIA_EXE`.
+- Full parameter, response, element-ID-scope and error-code reference: [docs/mcp-contract.md](docs/mcp-contract.md).
 
-There is also `clients/uia-driver.cjs`, a tiny scripted driver: give it a JSON job
-(`{ "title": "window title", "steps": [{ "tool": "app_snapshot", "args": {} }] }`) and it spawns the
-server, runs the steps and prints the receipts. Point it at your build with `ORCA_UIA_EXE`.
+---
 
-```powershell
-$env:ORCA_UIA_EXE = 'D:/orca-uia/src/bin/Release/net8.0-windows/orca-uia.exe'
-node clients/uia-driver.cjs job.json
+## Tools (9)
+
+| Tool | Purpose | Key Parameters |
+| --- | --- | --- |
+| `app_launch` | Launch an app (auto-injects `--force-renderer-accessibility` for known Chromium/Electron hosts) and attach | `path`, `args`, `title_contains`, `force_accessibility`, `preload_ms` |
+| `app_attach` | Attach to a running top-level window (skips tiny tray/IME stubs) and preload its UIA tree | `title_contains`, `pid`, `preload`, `preload_ms` |
+| `app_warmup` | Poll descendant node count until a lazily-built Electron/Chromium AX tree stabilizes | `min_nodes`, `timeout_ms` |
+| `app_window` | List, show, hide, or focus top-level `HWND`s — including hidden/tray windows invisible to UIA | `action` (`list\|show\|hide\|focus`), `pid`, `title_contains`, `class_contains` |
+| `app_cdp` | Drive Chromium/Electron `contenteditable` editors & DOM directly via DevTools Protocol (zero OS input) | `action` (`targets\|eval\|focus\|insert_text\|clear\|click\|wait_for\|key`), `port`, `selector`, `text` |
+| `app_snapshot` | Dump the visible control tree as compact text with snapshot-scoped IDs (`e1`, `e2`...) and state flags | `interactive_only`, `max_nodes` |
+| `app_act` | Execute a single action or a multi-step `steps[]` sequence by snapshot ID or live selector, returning post-state & diff | `id` or `target`, `action` (`click\|set_value\|type\|press\|toggle`), `input` (`pattern\|physical`), `steps[]`, `changes` |
+| `app_wait` | Wait until an element whose name contains a substring appears or disappears | `name_contains`, `state` (`appear\|gone`), `timeout_ms` |
+| `app_shot` | Capture a PNG of a single window (`PrintWindow` with `PW_RENDERFULLCONTENT`) for vision fallback | `path`, `title_contains`, `pid` |
+
+---
+
+## Example: Multi-Step Workflow in One Call
+
+Because live selectors re-resolve against the current tree on every step, an agent can chain interactions across UI transitions without stopping to re-snapshot:
+
+```json
+{
+  "tool": "app_act",
+  "arguments": {
+    "changes": true,
+    "stop_on_error": true,
+    "steps": [
+      { "action": "click", "type": "TabItem", "name": "Settings" },
+      { "action": "wait", "name_contains": "API Key", "state": "appear" },
+      { "action": "set_value", "type": "Edit", "name_contains": "API Key", "text": "sk-demo-key" },
+      { "action": "click", "type": "Button", "name": "Save" }
+    ]
+  }
+}
 ```
+
+Each step returns a structured line with the actual mechanism taken (`used`: `invoke`, `value`, `wm_settext`, etc.), readback `state`, and `changed` (`added` / `removed` / `enabled_changed`).
+
+---
 
 ## Running a job without stealing the screen
 
-Driving a real app means the app comes to the front. On a machine someone is using, that costs
-them their typing and pollutes their screenshots, so a run should give the screen back:
+Driving a real app means the app comes to the front. On a machine someone is using, that costs them their typing and pollutes their screenshots, so a run should give the screen back:
 
-1. **Ask first.** A scripted run takes seconds and moves focus; start it when the machine is free.
-2. **Minimise what you launch.** `Start-Process notepad -WindowStyle Minimized`, or launch and move
-   focus back before attaching. A UWP app can ignore the flag — it should be closed afterwards.
-3. **Let the driver clean up.** Two job-level options:
+1. **Ask first.** A scripted run takes seconds and moves focus; start it when the machine is free. `app_launch` / `app_window show` already ask UIA to show the window without activating it (`WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`), and `foreground_policy` defaults to `forbid`, so a step that would need the foreground is refused with a hint instead of silently taking over.
+2. **Minimise what you launch.** `Start-Process notepad -WindowStyle Minimized`, or launch and move focus back before attaching. A UWP app can ignore the flag — it should be closed afterwards.
+3. **Let the driver clean up.** Two job-level options in `clients/uia-driver.cjs`:
 
 ```json
 { "title": "…",
@@ -80,29 +134,42 @@ them their typing and pollutes their screenshots, so a run should give the scree
   "steps": [ … ] }
 ```
 
-`restore_foreground` (or `ORCA_UIA_FOREGROUND` in the environment) re-focusses the window whose
-title contains that string when the run ends; `kill_on_exit` closes the app the job drove — give a
-process name, or `true` to use the process the attach reply names. Both print what they did
-(`FOREGROUND …`, `KILL …`), so a run that fails mid-way still leaves the desktop as it found it.
+`restore_foreground` (or `ORCA_UIA_FOREGROUND` in the environment) re-focusses the window whose title contains that string when the run ends; `kill_on_exit` closes the app the job drove — give a process name, or `true` to use the process the attach reply names. Both print what they did (`FOREGROUND …`, `KILL …`), so a run that fails mid-way still leaves the desktop as it found it.
 
-## Known limits
+---
 
-- **Snapshot ids are single-use.** After any action the id may be gone: re-snapshot, or use a live
-  target (`{type, name, name_contains, aid}`), which is re-resolved each call.
-- **Packaged/UWP apps** (Windows Calculator, Settings) put their UI in a child process; attaching
-  by title lands on the `ApplicationFrameWindow` and can return an empty tree — use `pid` then. The
-  pid changes on every launch.
-- **Electron/Chromium** only builds its accessibility tree when asked: expect `app_warmup`, and add
-  `--force-renderer-accessibility` for hosts that don't do it on their own.
-- **Elevated windows** can't be driven from a non-elevated process: UIA is blocked by UIPI, and the
-  failure looks like an empty tree rather than an error.
-- **Password fields** are masked by UIA by design; the server reports `IsPassword` and never tries
-  to read the value.
-- The engine is single-threaded on one STA apartment (UIA3 requires it) and pumps a Win32 message
-  queue between requests — a blocking UIA call stalls the whole server until its timeout.
+## Architecture & Known Boundaries
 
-## Status
+- **Single STA Thread + Message Pump:** `Program.cs` reads `stdin` on a dedicated reader thread and dispatches all UIA3/COM calls on one STA worker thread with an explicit Win32 `PeekMessage`/`DispatchMessage` pump, preventing cross-apartment COM timeouts.
+- **Structured Errors:** Failures return `{ "error": "<CODE>", "message": "...", "hint": "..." }` (`NOT_FOUND`, `AMBIGUOUS_MATCH`, `UNKNOWN_ID`, `NO_VALUE_PATTERN`, `CDP_UNAVAILABLE`, etc.) so agents can self-correct deterministically.
+- **Snapshot IDs are scoped to the latest snapshot.** They are re-resolved server-side, but a new snapshot restarts numbering at `e1`: an old ID that happens to name an existing entry will resolve to the *new* entry with that number. Discard IDs after a snapshot, or use a live selector (`{type, name, name_contains, aid}`).
+- **Known Windows Boundaries:**
+  - **UIPI:** A Medium-IL `orca-uia` process cannot control elevated (Administrator) windows without `uiAccess` signing. The failure looks like an empty tree, not an error.
+  - **Electron Editors:** `contenteditable` boxes ignore UIA `ValuePattern` and have no `HWND`; start the target with `--remote-debugging-port=<port>` and use `app_cdp`.
+  - **UWP / Packaged Apps:** Launchers hand off to `ApplicationFrameHost.exe`; attaching by title lands on the frame window and can return an empty tree — attach by the owner `pid` instead. The pid changes on every launch.
+  - **Password fields** are masked by UIA by design; the server reports `IsPassword` and never tries to read the value.
+  - A blocking UIA call stalls the whole server until its timeout, because every call shares the one STA thread.
 
-Early but usable: it drives Notepad, Windows Calculator and Electron apps (DeepSeek Harness,
-Cursor) end to end. MIT licensed. Issues and counter-examples are welcome — especially apps where
-the tree is empty, stale, or the action silently doesn't take.
+---
+
+## Roadmap
+
+- [x] 9 core MCP tools over stdio JSON-RPC 2.0 (STA + Win32 message pump)
+- [x] Multi-step `steps[]` live-selector execution with tree diff & readback warnings
+- [x] Built-in `app_cdp` & `app_window` for Electron and tray apps
+- [x] `foreground_policy` guard (`forbid` / `allow_on_idle` / `allow`) plus non-activating launch/show — `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`
+- [x] Foreground sentinel script (`tests/foreground-sentinel.ps1`) that separates "took the foreground" from "focus event only"
+- [ ] Run the sentinel in CI as an acceptance gate
+- [ ] Zero-steal `SetWinEventHook` path (no focus events at all)
+- [ ] Shadow Desktop (`CreateDesktop`) launcher for invisible Win32 & Electron isolation
+- [ ] Raw JSON tree dump for **Visual Protocol v0** cross-surface auditing
+
+---
+
+## Ecosystem
+
+`orca-uia` serves as the Windows Desktop Surface Adapter for **Visual Collaboration** — alongside [`figma-ordered-pins`](https://github.com/tokc2327-code/figma-ordered-pins) for Figma canvases.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Issues and counter-examples are welcome, especially apps where the tree is empty, stale, or the action silently doesn't take.

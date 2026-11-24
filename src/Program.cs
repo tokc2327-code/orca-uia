@@ -3,6 +3,7 @@
 // message queue which we pump between requests (see Pump below). Some COM/UIA calls post
 // messages back to the calling apartment and will time out if nobody pumps them.
 using System.Collections.Concurrent;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -30,6 +31,8 @@ static void Run(BlockingCollection<string?> queue)
     Pump.Drain();
 
     using var engine = new Engine();
+    var serverVersion = Assembly.GetExecutingAssembly()
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion;
     var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
 
     while (true)
@@ -62,7 +65,7 @@ static void Run(BlockingCollection<string?> queue)
                     {
                         ["protocolVersion"] = req["params"]?["protocolVersion"]?.GetValue<string>() ?? "2025-03-26",
                         ["capabilities"] = new JsonObject { ["tools"] = new JsonObject() },
-                        ["serverInfo"] = new JsonObject { ["name"] = "orca-uia", ["version"] = "0.1.0" }
+                        ["serverInfo"] = new JsonObject { ["name"] = "orca-uia", ["version"] = serverVersion }
                     };
                     break;
                 case "ping":

@@ -6,6 +6,6 @@
       config:
         serverName: uia
         transport: stdio
-        command: D:/orca-uia/src/bin/Release/net8.0-windows/orca-uia.exe
+        command: D:/orca-uia/dist/win-x64/orca-uia.exe
         failOnStartupError: true
         toolCallTimeoutMs: 120000
