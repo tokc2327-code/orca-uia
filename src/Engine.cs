@@ -41,10 +41,68 @@ internal static class NativeWin
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    public static readonly IntPtr HWND_BOTTOM = new IntPtr(1);
+    public const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010;
+    // SW_SHOWNOACTIVATE: show, but do not take the keyboard. 5 would be SW_SHOW, 9 SW_RESTORE.
+    public const int SW_SHOWNOACTIVATE = 4;
+    // Push a window to the bottom of the z-order without moving, resizing or activating it.
+    public static void SinkWithoutActivating(IntPtr h) => SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved, lpDesktop, lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        public short wShowWindow, cbReserved2;
+        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    public const int STARTF_USESHOWWINDOW = 0x1;
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessW(string app, string cmdLine, IntPtr pa, IntPtr ta, bool inherit,
+        uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+
+    // Process.Start cannot ask for SW_SHOWNOACTIVATE, so the very first window of a freshly
+    // launched app takes the keyboard. CreateProcessW can: the app comes up without activating.
+    public static Process StartWithoutActivating(string path, string args)
+    {
+        var cmdLine = new StringBuilder("\"").Append(path).Append('"');
+        if (!string.IsNullOrWhiteSpace(args)) cmdLine.Append(' ').Append(args.Trim());
+        var si = new STARTUPINFO
+        {
+            cb = Marshal.SizeOf<STARTUPINFO>(),
+            dwFlags = STARTF_USESHOWWINDOW,
+            wShowWindow = (short)SW_SHOWNOACTIVATE
+        };
+        var dir = Path.GetDirectoryName(path);
+        if (!CreateProcessW(null, cmdLine.ToString(), IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, dir, ref si, out var pi))
+            throw new ToolError("LAUNCH_FAILED", $"CreateProcessW failed ({Marshal.GetLastWin32Error()}) for {path}",
+                "check the path; a .cmd/.bat launcher must be started through cmd.exe");
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return Process.GetProcessById(pi.dwProcessId);
+    }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, string s);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     public struct RECT { public int L, T, R, B; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+    // Milliseconds since the last keyboard/mouse input anywhere on the desktop. TickCount and
+    // dwTime are both wrap-around counters, so the uint subtraction stays correct at the wrap.
+    public static uint GetIdleMs()
+    {
+        var lii = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
+        if (!GetLastInputInfo(ref lii)) return 0; // cannot tell: report "active" so a gate stays closed
+        return unchecked((uint)Environment.TickCount - lii.dwTime);
+    }
 }
 
 public class Recipe
@@ -176,8 +234,8 @@ public class Engine : IDisposable
         // Chromium hosts, and let the caller force it on or off explicitly.
         var force = a["force_accessibility"]?.GetValue<bool>() ?? LooksLikeChromium(path);
         if (force) args += " --force-renderer-accessibility";
-        var psi = new ProcessStartInfo(path, args.Trim()) { UseShellExecute = false };
-        var proc = Process.Start(psi) ?? throw new ToolError("LAUNCH_FAILED", "Process.Start returned null");
+        // Launch without activating: no restore-and-raise on the first window either.
+        var proc = NativeWin.StartWithoutActivating(path, args);
         var title = a["title_contains"]?.GetValue<string>(); // needed when the launcher exits (e.g. code.cmd)
         var deadline = DateTime.UtcNow.AddMilliseconds(a["timeout_ms"]?.GetValue<int>() ?? 30000);
         while (DateTime.UtcNow < deadline)
@@ -463,9 +521,28 @@ public class Engine : IDisposable
             ?? throw new ToolError("WINDOW_NOT_FOUND", "no hwnd matched (hidden windows are included)",
                 "call app_window with action:\"list\" to see every top-level window of that process");
         bool before = best.Visible;
-        if (action == "show") { NativeWin.ShowWindow(best.H, 9 /* SW_RESTORE */); NativeWin.SetForegroundWindow(best.H); }
+        // Showing a window is not a reason to take the keyboard away from whoever is typing.
+        // Default: show without activating, then sink to the bottom of the z-order. Only an
+        // explicit foreground_policy:"allow" gets the old restore-and-raise behaviour.
+        if (action == "show")
+        {
+            if (a["foreground_policy"]?.GetValue<string>() == "allow")
+            {
+                NativeWin.ShowWindow(best.H, 9 /* SW_RESTORE */);
+                NativeWin.SetForegroundWindow(best.H);
+            }
+            else
+            {
+                NativeWin.ShowWindow(best.H, NativeWin.SW_SHOWNOACTIVATE);
+                NativeWin.SinkWithoutActivating(best.H);
+            }
+        }
         else if (action == "hide") NativeWin.ShowWindow(best.H, 0 /* SW_HIDE */);
-        else if (action == "focus") NativeWin.SetForegroundWindow(best.H);
+        else if (action == "focus")
+        {
+            AssertForegroundAllowed(a, "app_window.focus");
+            NativeWin.SetForegroundWindow(best.H);
+        }
         else throw new ToolError("BAD_ARGS", "action must be list|show|hide|focus");
 
         Thread.Sleep(a["settle_ms"]?.GetValue<int>() ?? 400);
@@ -528,10 +605,10 @@ public class Engine : IDisposable
             try { ok = NativeWin.PrintWindow(hit.H, hdc, 2 /* PW_RENDERFULLCONTENT */); }
             finally { g.ReleaseHdc(hdc); }
             if (!ok)
-            {
-                used = "screen";
-                g.CopyFromScreen(rc.L, rc.T, 0, 0, new Size(w2, h2));
-            }
+                // No screen-copy fallback on purpose: copying the screen region would hand back
+                // whatever the person has in front of that window, not the window itself.
+                throw new ToolError("SHOT_FAILED", "PrintWindow could not render this window",
+                    "the window may be minimised or on another desktop; restore it without activating, or use app_cdp Page.captureScreenshot for Electron");
         }
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
@@ -724,7 +801,7 @@ public class Engine : IDisposable
         var before = (a["changes"]?.GetValue<bool>() ?? false) ? SnapshotNames() : null;
         var sw = Stopwatch.StartNew();
 
-        var used = RunAction(el, action, text, input);
+        var used = RunAction(el, action, text, input, a);
 
         Thread.Sleep(a["settle_ms"]?.GetValue<int>() ?? 150);
         var st = StateOfEl(el);
@@ -943,6 +1020,27 @@ public class Engine : IDisposable
             : $"only part of the text landed (value=\"{Trunc(v)}\"); retry action=type, or use action=set_value";
     }
 
+    // A physical click or keystroke takes the pointer and keyboard away from whoever is using
+    // the machine. UIA patterns do not, so they never come through here; physical input has to
+    // be opted into per call. Default is forbid: failing closed beats stealing the cursor.
+    static void AssertForegroundAllowed(JsonObject? a, string op)
+    {
+        var policy = a?["foreground_policy"]?.GetValue<string>() ?? "forbid";
+        if (policy == "allow") return;
+        if (policy == "allow_on_idle")
+        {
+            int need = a?["idle_ms"]?.GetValue<int>() ?? 3000;
+            uint idle = NativeWin.GetIdleMs();
+            if (idle >= (uint)need) return;
+            throw new ToolError("USER_ACTIVE", $"{op} needs an idle machine: only {idle} ms since the last input, {need} ms required",
+                "retry after the person stops typing, or pass foreground_policy:\"allow\" to take over now");
+        }
+        if (policy == "forbid")
+            throw new ToolError("FOREGROUND_FORBIDDEN", $"{op} would steal foreground from the person using the machine",
+                "use a UIA pattern instead (input:\"pattern\"), or app_cdp, or pass foreground_policy:\"allow\"");
+        throw new ToolError("BAD_ARGS", $"foreground_policy must be allow|allow_on_idle|forbid, got \"{policy}\"");
+    }
+
     // ---------- one action, no snapshot bookkeeping ----------
 
     // Plain Win32 edit controls answer WM_SETTEXT / EM_REPLACESEL across processes, with no
@@ -970,7 +1068,7 @@ public class Engine : IDisposable
     // Never touch the real pointer or keyboard unless the caller says input:"physical".
     // The default path uses UIA patterns only, so a sequence can run while the person keeps
     // using the machine. Returns the path that was actually taken, for the receipt.
-    static string RunAction(AutomationElement el, string action, string? text, string input)
+    static string RunAction(AutomationElement el, string action, string? text, string input, JsonObject? policy = null)
     {
         bool physical = string.Equals(input, "physical", StringComparison.OrdinalIgnoreCase);
         switch (action)
@@ -1000,6 +1098,7 @@ public class Engine : IDisposable
                     el.Focus();
                     return pre + "focus";
                 }
+                AssertForegroundAllowed(policy, "app_act.click(physical)");
                 el.Click();
                 return pre + "physical";
             case "set_value":
@@ -1023,6 +1122,7 @@ public class Engine : IDisposable
                 if (text == null) throw new ToolError("BAD_ARGS", "text required");
                 if (physical)
                 {
+                    AssertForegroundAllowed(policy, "app_act.type(physical)");
                     el.Focus();
                     Keyboard.Type(text);
                     return "physical";
@@ -1046,6 +1146,7 @@ public class Engine : IDisposable
                 if (text == null || !Enum.TryParse<VirtualKeyShort>(text, true, out var key))
                     throw new ToolError("BAD_ARGS", "text must be a VirtualKeyShort name, e.g. ENTER, TAB, ESCAPE");
                 if (!physical) throw new ToolError("PHYSICAL_ONLY", "a key press is real input", "pass input:\"physical\" to send it");
+                AssertForegroundAllowed(policy, "app_act.press(physical)");
                 el.Focus();
                 Keyboard.Type(key);
                 return "physical";
@@ -1094,7 +1195,9 @@ public class Engine : IDisposable
                 var el = ResolveTarget(st);
                 var target = DescribeTarget(el);
                 var before = reportChanges ? SnapshotNames() : null;
-                var used = RunAction(el, action, text, input);
+                // foreground_policy may be set per step or once for the whole call.
+                var pol = st["foreground_policy"] != null ? st : a;
+                var used = RunAction(el, action, text, input, pol);
                 Thread.Sleep(st["settle_ms"]?.GetValue<int>() ?? settleDefault);
                 var state = StateOfEl(el);
                 var line = new JsonObject
@@ -1260,6 +1363,7 @@ public static class Tools
         Tool("app_window", "Find, list, show or hide a top-level window by pid/title/class. Hidden and tray windows are included: UIA cannot see those, but the HWND is still there and ShowWindow brings them back without touching the mouse.",
             new JsonObject { ["action"] = S("list (default) | show | hide | focus"), ["pid"] = I("process id"),
                 ["title_contains"] = S("title substring"), ["class_contains"] = S("window class substring, e.g. Tauri Window"),
+                ["foreground_policy"] = S("allow|allow_on_idle|forbid (default forbid): show never activates unless allow; focus needs this"),
                 ["settle_ms"] = I("default 400") }),
         Tool("app_cdp", "Chromium/Electron editors (contenteditable) have no Value pattern and no HWND, so UIA and WM_SETTEXT both fail. This talks to the renderer's DevTools protocol instead: full text lands in the box with no OS keyboard and no mouse. Needs the app started with --remote-debugging-port=<port>.",
             new JsonObject { ["action"] = S("targets (default) | eval | focus | insert_text | clear | click | wait_for | key"),
@@ -1285,10 +1389,12 @@ public static class Tools
                 ["steps"] = new JsonObject { ["type"] = "array", ["description"] = "sequence: [{action|wait, id|target|type|name|name_contains|aid|index, text, settle_ms}]" },
                 ["changes"] = B("report appeared/removed/enabled-changed nodes; default true for steps, false for a single act"),
                 ["stop_on_error"] = B("stop the sequence at the first failed step; default true"),
+                ["foreground_policy"] = S("allow|allow_on_idle|forbid (default forbid): whether physical input may take the foreground; also settable per step"),
+                ["idle_ms"] = I("allow_on_idle: required quiet time before taking over, default 3000"),
                 ["settle_ms"] = I("default 150") }),
         Tool("app_wait", "Wait until an element whose name contains a substring appears or disappears.",
             new JsonObject { ["name_contains"] = S("substring"), ["state"] = S("appear|gone"), ["timeout_ms"] = I("default 5000") }, "name_contains"),
-        Tool("app_shot", "Save a PNG of one top-level window (PrintWindow, screen-copy fallback) so a vision-capable client can look at it. Returns the absolute path and size.",
+        Tool("app_shot", "Save a PNG of one top-level window via PrintWindow (no screen copy: the pixels always belong to that window, never to whatever covers it) so a vision-capable client can look at it. Returns the absolute path and size.",
             new JsonObject { ["path"] = S("absolute .png path to write"), ["title_contains"] = S("window title substring"), ["pid"] = I("process id") }, "path"),
     };
 }
