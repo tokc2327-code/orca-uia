@@ -167,17 +167,33 @@ One trap in the setup: if the driven window happens to be in front when the sent
 
 ---
 
-## Roadmap
+## Verified, and what this is not
+
+`orca-uia` is a **reference implementation**: it exists to show that a Windows desktop surface can be driven by structure instead of screenshots, and nothing more. Everything marked verified below was measured on this machine — Windows 11, .NET 8, UIA3 / FlaUI 5.0, Calculator — and can be reproduced with the scripts in `tests/`.
+
+### Verified
 
 - [x] 9 core MCP tools over stdio JSON-RPC 2.0 (STA + Win32 message pump)
 - [x] Multi-step `steps[]` live-selector execution with tree diff & readback warnings
 - [x] Built-in `app_cdp` & `app_window` for Electron and tray apps
 - [x] `foreground_policy` guard (`forbid` / `allow_on_idle` / `allow`) plus non-activating launch/show — `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`
 - [x] Foreground sentinel (`tests/foreground-sentinel.ps1`) that sorts each WinEvent into `steal` / `inert` / `same-window` instead of calling every focus event a steal
-- [x] No focus events on the driven window during a scripted run — measured on the 33-step calculator acceptance: 0 steals, 0 focus events, foreground handle unchanged start to end
-- [ ] Sentinel as an automated acceptance gate (needs an interactive desktop; today it is a manual step)
-- [ ] Shadow Desktop (`CreateDesktop`) launcher for invisible Win32 & Electron isolation
-- [ ] Raw JSON tree dump for **Visual Protocol v0** cross-surface auditing
+- [x] No focus events on the driven window during a scripted run — 33-step calculator acceptance: 0 steals, 0 focus events, foreground handle unchanged start to end
+
+### Non-Goals
+
+Deliberately not done. These are boundaries, not a backlog:
+
+- **No per-application compatibility work.** No "make it work on app X" patches, no vendor-specific quirks. Apps where the tree is empty, stale, or silent stay that way.
+- **No full UIA surface.** Nine tools, not a wrapper around every pattern.
+- **No elevated targets.** UIPI blocks a Medium-IL process from driving Administrator windows; `uiAccess` signing is out of scope.
+- **No shadow desktop.** `CreateDesktop` isolation, virtual displays and invisible Electron hosting are not planned here.
+- **No CI acceptance gate.** The sentinel needs an interactive desktop session; it stays a manual step.
+- **No roadmap and no support contract.** Feature requests are answered with "fork it".
+
+### Maintenance policy
+
+Shared as-is, extracted from the **Visual Collaboration** ecosystem. There is no response-time promise, no compatibility patching for third-party apps, and no release schedule. Bug reports and counter-examples are welcome — especially apps where the tree comes back empty, stale, or where an action silently does nothing, since those make the reference implementation more honest. They are a contribution, not a support contract. `MIT` license: fork it, adapt it, ship your own.
 
 ---
 

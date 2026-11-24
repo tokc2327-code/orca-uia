@@ -168,7 +168,11 @@ pwsh -File tests\foreground-sentinel.ps1 `
 
 ---
 
-## 路线图(Roadmap)
+## 验证过的,和这不是什么
+
+`orca-uia` 是一份**参考实现**:它存在是为了说明「Windows 桌面可以被结构化地驱动,而不是靠截图」,仅此而已。下面打了勾的都在本机实测过——Windows 11、.NET 8、UIA3 / FlaUI 5.0、计算器——用 `tests/` 里的脚本可以复现。
+
+### 已验证
 
 - [x] stdio JSON-RPC 2.0 上的 9 个核心 MCP 工具(STA + Win32 消息泵)
 - [x] `steps[]` 多步实时选择器执行,带控件树差异与回读告警
@@ -176,9 +180,21 @@ pwsh -File tests\foreground-sentinel.ps1 `
 - [x] `foreground_policy` 三档(`forbid` / `allow_on_idle` / `allow`)+ 不激活的启动与显示——`WS_EX_NOACTIVATE`、`SW_SHOWNOACTIVATE`
 - [x] 前台哨兵(`tests/foreground-sentinel.ps1`),把每条 WinEvent 分成 `steal` / `inert` / `same-window`,而不是把每条焦点事件都当抢占
 - [x] 脚本化运行期间,被驱动窗口上没有任何焦点事件——33 步计算器验收实测:0 抢占、0 焦点事件、前台句柄全程没变
-- [ ] 把哨兵做成自动验收门(需要交互式桌面;现在是手工一步)
-- [ ] 影子桌面(`CreateDesktop`)启动器,给 Win32 与 Electron 做不可见隔离
-- [ ] 原始 JSON 树导出,**Visual Protocol v0** 的跨界面核查
+
+### 不做什么
+
+这些都是**边界,不是待办**:
+
+- **不做按软件逐个适配。** 没有「让它在某某应用上跑通」的补丁,不追第三方改版。控件树为空、过期、或者动作静默不生效的应用,就保持那样。
+- **不做全量 UIA 封装。** 九个工具,不是一个把所有 Pattern 都包一遍的库。
+- **不支持提权窗口。** 中等完整性级别进程驱动不了管理员窗口,`uiAccess` 签名不在范围内。
+- **不做影子桌面。** `CreateDesktop` 隔离、虚拟显示器、不可见 Electron 托管,这里都不打算做。
+- **不把哨兵做成 CI 门。** 它要一个交互式桌面会话,只能是手工一步。
+- **没有路线图,也没有支持承诺。** 想要新功能,答案是 fork。
+
+### 维护声明
+
+按现状(As-Is)分享,从 **Visual Collaboration** 生态里抽出来的独立模块。不承诺响应时间、不为第三方应用做兼容补丁、没有发布节奏。欢迎提 issue 和反例——尤其是控件树为空、过期、或者动作静默没生效的应用,那些能让这份参考实现更诚实。它们算贡献,不算支持合同。`MIT` 许可:拿去 fork、拿去改、拿去发你自己的。
 
 ---
 
