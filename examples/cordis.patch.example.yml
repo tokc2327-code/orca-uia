@@ -1,0 +1,11 @@
+# DeepSeek Harness bundle patch: registers this server as the stdio MCP client "uia".
+# Replace the command with your own build path; keep the forward slashes.
+- insert:
+    - id: mcp-orca-uia
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: uia
+        transport: stdio
+        command: D:/orca-uia/src/bin/Release/net8.0-windows/orca-uia.exe
+        failOnStartupError: true
+        toolCallTimeoutMs: 120000
