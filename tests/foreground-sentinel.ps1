@@ -1,4 +1,4 @@
-# 前台哨兵:跑一条命令,同时盯着 WinEvent 的「前台切换」和「焦点变化」,把命令期间
+﻿# 前台哨兵:跑一条命令,同时盯着 WinEvent 的「前台切换」和「焦点变化」,把命令期间
 # 抢走焦点的事件一条条记下来。
 #
 # 用法:
@@ -18,6 +18,12 @@ param(
     [string]$ReportPath = "fg-sentinel-report.json",
     [string]$WatchPids = ""
 )
+
+# 需要在 PowerShell 7(pwsh)下跑:内联的 C# 用了属性初始化器,C# 5 的编译器(Windows PowerShell 5.1)编不过。
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    Write-Error '[sentinel] needs PowerShell 7+ (pwsh): the inline C# uses C# 6+ syntax. Run it with: pwsh -File tests\foreground-sentinel.ps1 ...'
+    exit 2
+}
 
 Add-Type -TypeDefinition @"
 using System;
