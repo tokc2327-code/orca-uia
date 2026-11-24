@@ -46,3 +46,23 @@ Real differences between what you'd write from intuition and what the UI actuall
 
 One process, one boot. No cross-process or after-hours-uptime run; Electron/Chromium targets and
 `app_cdp` are a separate check.
+
+## Foreground: measured, not assumed
+
+The 33 steps above were re-run under `tests/foreground-sentinel.ps1`, watching only the driven
+processes (`-WatchPids "<CalculatorApp pid>,<ApplicationFrameHost pid>"`):
+
+| run | steps | `steal` | `inert` | `same-window` | foreground start → end |
+|---|---|---|---|---|---|
+| calculator acceptance | 33/33 ok | 0 | 0 | 0 | `0x50842` → `0x50842` |
+
+No WinEvent of either kind fired on the driven window: the app is never activated, and no focus
+event escapes into it. The earlier "1 FOCUS on the calculator frame" was an artefact of the
+measurement: the old sentinel took "whatever had the foreground when the script started" as the
+baseline, so when the calculation had just been launched it counted the app's own focus against
+itself, and when the console came up it counted the harness.
+
+Control, so the hook is known to be awake: a background process calling `SetForegroundWindow` on
+Notepad is caught as 1 `FOREGROUND` + 2 `FOCUS` steals. An `inert` record — a focus event inside a
+`WS_EX_NOACTIVATE` window — has not been produced deliberately yet; that branch of the classifier
+is code-only.

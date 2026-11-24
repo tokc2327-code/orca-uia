@@ -136,6 +136,21 @@ dotnet publish src/OrcaUia.csproj -c Release -r win-x64
 ```
 
 `restore_foreground`(或环境变量 `ORCA_UIA_FOREGROUND`)在运行结束时把标题含该串的窗口重新聚焦;`kill_on_exit` 关掉这次任务驱动的应用——给进程名,或给 `true` 表示用附加回执里报的那个进程。两者都会打印自己做了什么(`FOREGROUND …`、`KILL …`),所以中途失败的一次运行也会把桌面还原成原样。
+4. **量出来,别猜。** `tests/foreground-sentinel.ps1` 挂上 `EVENT_SYSTEM_FOREGROUND` 和 `EVENT_OBJECT_FOCUS`,跑完把每条事件分成三档:
+
+   - `steal` —— 前台离开了基准窗口,或焦点落进一个「能被激活、但当时不在前面」的窗口。键盘真的被拿走了,这次运行判失败。
+   - `inert` —— 焦点落在带 `WS_EX_NOACTIVATE` 的窗口里。这种窗口激活不了,内部焦点拿不走键盘;照样记下来,但不算失败。
+   - `same-window` —— 事件落在本来就在前面的那扇窗里,谁都没被动。
+
+```powershell
+pwsh -File tests\foreground-sentinel.ps1 `
+  -RunCommand 'node clients\uia-driver.cjs examples\acceptance-calculator-cn.json' `
+  -ReportPath evidence\fg.json -WatchPids "<CalculatorApp pid>,<ApplicationFrameHost pid>"
+```
+
+`-WatchPids` 把监控收到被驱动的进程上。不给它的话,人自己切窗口和抢占分不开,都会被记成违规——那这脚本就只能在机器空着时跑。**33 步计算器验收,带 `-WatchPids` 的实测:33/33 步全过,`stealCount: 0`、`inertFocusCount: 0`、`sameWindowCount: 0`,跑完前台句柄和开始一模一样。** 反向对照也做了:后台进程对记事本调 `SetForegroundWindow`,哨兵抓到 1 条 `FOREGROUND` + 2 条 `FOCUS`,说明钩子不是睡着的。
+
+还有个坑:如果被驱动的窗口在哨兵启动时正好在前台,它内部的焦点事件就是拿它自己当基准,跑出来会显得比实际干净。构造函数会给最多 5 秒等前台离开被盯的进程,等不到就在报告里写 `baselineIsWatched: true`。
 
 ---
 
@@ -159,9 +174,9 @@ dotnet publish src/OrcaUia.csproj -c Release -r win-x64
 - [x] `steps[]` 多步实时选择器执行,带控件树差异与回读告警
 - [x] 内置 `app_cdp` 与 `app_window`,覆盖 Electron 和托盘应用
 - [x] `foreground_policy` 三档(`forbid` / `allow_on_idle` / `allow`)+ 不激活的启动与显示——`WS_EX_NOACTIVATE`、`SW_SHOWNOACTIVATE`
-- [x] 前台哨兵脚本(`tests/foreground-sentinel.ps1`),把「真的抢了前台」和「只是焦点事件」分开
-- [ ] 把哨兵放进 CI 当验收门
-- [ ] 零抢占的 `SetWinEventHook` 路径(连焦点事件都不产生)
+- [x] 前台哨兵(`tests/foreground-sentinel.ps1`),把每条 WinEvent 分成 `steal` / `inert` / `same-window`,而不是把每条焦点事件都当抢占
+- [x] 脚本化运行期间,被驱动窗口上没有任何焦点事件——33 步计算器验收实测:0 抢占、0 焦点事件、前台句柄全程没变
+- [ ] 把哨兵做成自动验收门(需要交互式桌面;现在是手工一步)
 - [ ] 影子桌面(`CreateDesktop`)启动器,给 Win32 与 Electron 做不可见隔离
 - [ ] 原始 JSON 树导出,**Visual Protocol v0** 的跨界面核查
 

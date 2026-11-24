@@ -135,6 +135,21 @@ Driving a real app means the app comes to the front. On a machine someone is usi
 ```
 
 `restore_foreground` (or `ORCA_UIA_FOREGROUND` in the environment) re-focusses the window whose title contains that string when the run ends; `kill_on_exit` closes the app the job drove — give a process name, or `true` to use the process the attach reply names. Both print what they did (`FOREGROUND …`, `KILL …`), so a run that fails mid-way still leaves the desktop as it found it.
+4. **Measure it, don't assume it.** `tests/foreground-sentinel.ps1` hooks `EVENT_SYSTEM_FOREGROUND` and `EVENT_OBJECT_FOCUS`, runs the job, and sorts every event into three buckets:
+
+   - `steal` — the foreground left the baseline window, or focus landed in an activatable window that was not in front. The keyboard really moved; the run fails.
+   - `inert` — focus inside a `WS_EX_NOACTIVATE` window. Such a window cannot activate, so its internal focus cannot take the keyboard; recorded, but not a failure.
+   - `same-window` — an event inside whatever was already in front. Nobody was moved.
+
+```powershell
+pwsh -File tests\foreground-sentinel.ps1 `
+  -RunCommand 'node clients\uia-driver.cjs examples\acceptance-calculator-cn.json' `
+  -ReportPath evidence\fg.json -WatchPids "<CalculatorApp pid>,<ApplicationFrameHost pid>"
+```
+
+`-WatchPids` narrows the watch to the driven processes. Without it, a person moving their own windows is indistinguishable from a steal and gets reported as one — the script is then only usable on an idle machine. Measured on the 33-step calculator acceptance with `-WatchPids`: **33/33 steps ok, `stealCount: 0`, `inertFocusCount: 0`, `sameWindowCount: 0`, the foreground handle unchanged from start to end.** A hostile control (`SetForegroundWindow` on a Notepad from a background process) is still caught — 1 `FOREGROUND` + 2 `FOCUS` steals — so the hook is awake.
+
+One trap in the setup: if the driven window happens to be in front when the sentinel starts, every focus event inside it is measured against itself, and the run looks cleaner than it is. The constructor waits up to 5 s for the foreground to leave the watched pids and the report says `baselineIsWatched: true` when it could not.
 
 ---
 
@@ -158,9 +173,9 @@ Driving a real app means the app comes to the front. On a machine someone is usi
 - [x] Multi-step `steps[]` live-selector execution with tree diff & readback warnings
 - [x] Built-in `app_cdp` & `app_window` for Electron and tray apps
 - [x] `foreground_policy` guard (`forbid` / `allow_on_idle` / `allow`) plus non-activating launch/show — `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`
-- [x] Foreground sentinel script (`tests/foreground-sentinel.ps1`) that separates "took the foreground" from "focus event only"
-- [ ] Run the sentinel in CI as an acceptance gate
-- [ ] Zero-steal `SetWinEventHook` path (no focus events at all)
+- [x] Foreground sentinel (`tests/foreground-sentinel.ps1`) that sorts each WinEvent into `steal` / `inert` / `same-window` instead of calling every focus event a steal
+- [x] No focus events on the driven window during a scripted run — measured on the 33-step calculator acceptance: 0 steals, 0 focus events, foreground handle unchanged start to end
+- [ ] Sentinel as an automated acceptance gate (needs an interactive desktop; today it is a manual step)
 - [ ] Shadow Desktop (`CreateDesktop`) launcher for invisible Win32 & Electron isolation
 - [ ] Raw JSON tree dump for **Visual Protocol v0** cross-surface auditing
 
