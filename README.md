@@ -2,7 +2,7 @@
 
 # orca-uia
 
-**0.5.0**
+**0.5.0** · [中文](README.zh-CN.md)
 
 **Pattern-first, zero-mouse Windows UI Automation MCP server for AI agents.**
 
