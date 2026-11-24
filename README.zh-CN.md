@@ -153,7 +153,7 @@ dotnet publish src/OrcaUia.csproj -c Release -r win-x64
 
 ---
 
-## 路线
+## 路线图(Roadmap)
 
 - [x] stdio JSON-RPC 2.0 上的 9 个核心 MCP 工具(STA + Win32 消息泵)
 - [x] `steps[]` 多步实时选择器执行,带控件树差异与回读告警
