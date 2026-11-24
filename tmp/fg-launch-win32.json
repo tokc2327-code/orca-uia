@@ -1,6 +1,0 @@
-{
-  "steps": [
-    { "tool": "app_launch", "args": { "path": "C:\\Windows\\System32\\charmap.exe", "title_contains": "字符映射表", "timeout_ms": 20000 }, "expect": "\"launched\":true", "limit": 400 },
-    { "tool": "app_window", "args": { "action": "hide", "title_contains": "字符映射表" }, "limit": 400 }
-  ]
-}

@@ -8,3 +8,5 @@ obj/
 [Ll]ogs/
 /dist/*
 !/dist/.gitkeep
+/evidence/
+/tmp/

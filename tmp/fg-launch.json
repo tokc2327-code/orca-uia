@@ -1,5 +1,0 @@
-{
-  "steps": [
-    { "tool": "app_launch", "args": { "path": "C:\\Windows\\System32\\calc.exe", "title_contains": "计算器", "timeout_ms": 25000 }, "expect": "\"launched\":true", "limit": 600 }
-  ]
-}
