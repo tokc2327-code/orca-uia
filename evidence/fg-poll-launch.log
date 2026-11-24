@@ -1,0 +1,4 @@
+--- step 1/1 app_launch [ok]
+{"launched":true,"pid":19636,"launcher_pid":23488,"window":"\u8BA1\u7B97\u5668","nodes":88,"non_activating":true}
+
+SUMMARY steps=1 ok=1 failed=0

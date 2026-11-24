@@ -49,6 +49,52 @@ internal static class NativeWin
     // Push a window to the bottom of the z-order without moving, resizing or activating it.
     public static void SinkWithoutActivating(IntPtr h) => SetWindowPos(h, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+
+    // A newly launched app activates itself on its first ShowWindow no matter what STARTUPINFO
+    // asked for, so "never steal the foreground" cannot be done at launch. What we can do is
+    // give it straight back: the caller's window is put in front again right after the new
+    // window appears, so the person loses the keyboard for a blink instead of for good.
+    // SetForegroundWindow alone is refused for a background process, hence the AttachThreadInput
+    // dance with whoever holds the foreground right now.
+    public static void ForceForeground(IntPtr h)
+    {
+        if (h == IntPtr.Zero) return;
+        var fg = GetForegroundWindow();
+        if (fg == h) return;
+        uint fgThread = GetWindowThreadProcessId(fg, out _);
+        uint myThread = GetCurrentThreadId();
+        bool attached = fgThread != 0 && fgThread != myThread && AttachThreadInput(fgThread, myThread, true);
+        try { SetForegroundWindow(h); }
+        finally { if (attached) AttachThreadInput(fgThread, myThread, false); }
+    }
+
+    [DllImport("user32.dll")] public static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
+    [DllImport("user32.dll")] public static extern IntPtr SetWindowLongPtr(IntPtr h, int index, IntPtr value);
+    public const int GWL_EXSTYLE = -20;
+    public const long WS_EX_NOACTIVATE = 0x08000000L;
+
+    // WS_EX_NOACTIVATE: a click or a programmatic focus on this window no longer activates it, so
+    // the person's foreground window never moves and there is nothing to "give back" (restoring
+    // every step made the driven window flicker between front and back).
+    public static bool MakeNonActivating(IntPtr h, out bool ok)
+    {
+        ok = false;
+        if (h == IntPtr.Zero) return false;
+        try
+        {
+            var cur = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
+            if ((cur & WS_EX_NOACTIVATE) != 0) { ok = true; return true; }
+            SetWindowLongPtr(h, GWL_EXSTYLE, new IntPtr(cur | WS_EX_NOACTIVATE));
+            var now = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
+            ok = (now & WS_EX_NOACTIVATE) != 0;
+            return ok;
+        }
+        catch (Exception) { return false; }
+    }
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct STARTUPINFO
     {
@@ -211,6 +257,14 @@ public class Engine : IDisposable
         win = FindWindow(pid, title) ?? throw new ToolError("WINDOW_NOT_FOUND", "no top-level window matched",
             "windows under 80x60 are ignored (tray stubs, IME windows); if the app is minimized to the tray, open its window first");
         recipes.Clear();
+        // Attaching to a window someone else started: make it non-activating too, so UIA pattern
+        // actions cannot pull the foreground away from whoever is typing.
+        if (a["foreground_policy"]?.GetValue<string>() != "allow")
+        {
+            IntPtr hw = IntPtr.Zero;
+            try { hw = new IntPtr(win.Properties.NativeWindowHandle.ValueOrDefault); } catch (Exception) { }
+            NativeWin.MakeNonActivating(hw, out _);
+        }
         // Subscribing to UIA events makes UiaClientsAreListening() true -> Chromium builds its tree.
         auto.RegisterFocusChangedEvent(_ => { });
         var sw = Stopwatch.StartNew();
@@ -235,6 +289,7 @@ public class Engine : IDisposable
         var force = a["force_accessibility"]?.GetValue<bool>() ?? LooksLikeChromium(path);
         if (force) args += " --force-renderer-accessibility";
         // Launch without activating: no restore-and-raise on the first window either.
+        var fgBefore = NativeWin.GetForegroundWindow();
         var proc = NativeWin.StartWithoutActivating(path, args);
         var title = a["title_contains"]?.GetValue<string>(); // needed when the launcher exits (e.g. code.cmd)
         var deadline = DateTime.UtcNow.AddMilliseconds(a["timeout_ms"]?.GetValue<int>() ?? 30000);
@@ -252,8 +307,23 @@ public class Engine : IDisposable
                 string ownerName;
                 try { ownerPid = w.Properties.ProcessId.ValueOrDefault; ownerName = w.Properties.Name.ValueOrDefault; }
                 catch (Exception) { ownerPid = proc.Id; ownerName = null; }
+                // The app has just activated itself; hand the keyboard straight back to whoever
+                // had it. Once only: the window is made non-activating so it will not grab again,
+                // which is what used to make it flicker front/back on every step.
+                bool keepForeground = a["foreground_policy"]?.GetValue<string>() == "allow";
+                bool noActivate = false;
+                if (!keepForeground)
+                {
+                    IntPtr hw = IntPtr.Zero;
+                    try { hw = new IntPtr(w.Properties.NativeWindowHandle.ValueOrDefault); } catch (Exception) { }
+                    noActivate = NativeWin.MakeNonActivating(hw, out _);
+                    NativeWin.ForceForeground(fgBefore);
+                }
                 int preloaded = Preload(a["preload_ms"]?.GetValue<int>() ?? 1500);
-                return Json(new { launched = true, pid = ownerPid, launcher_pid = proc.Id, window = ownerName, nodes = preloaded });
+                // The app's first window can still activate during its own startup; one more
+                // hand-back, and only if the foreground really moved.
+                if (!keepForeground) NativeWin.ForceForeground(fgBefore);
+                return Json(new { launched = true, pid = ownerPid, launcher_pid = proc.Id, window = ownerName, nodes = preloaded, non_activating = noActivate });
             }
             // Launcher exited without a title to search by: it handed off (UWP, or an
             // existing browser main process took the request). Fail fast instead of
@@ -801,9 +871,14 @@ public class Engine : IDisposable
         var before = (a["changes"]?.GetValue<bool>() ?? false) ? SnapshotNames() : null;
         var sw = Stopwatch.StartNew();
 
+        // A pattern action on a UWP/native window can still activate it; give the foreground back
+        // afterwards so the person who was typing keeps it (unless policy says otherwise).
+        bool giveBack = (a["foreground_policy"]?.GetValue<string>() ?? "forbid") != "allow";
+        var fgWas = giveBack ? NativeWin.GetForegroundWindow() : IntPtr.Zero;
         var used = RunAction(el, action, text, input, a);
 
         Thread.Sleep(a["settle_ms"]?.GetValue<int>() ?? 150);
+        if (giveBack) NativeWin.ForceForeground(fgWas);
         var st = StateOfEl(el);
         var r = new JsonObject
         {
@@ -1197,8 +1272,11 @@ public class Engine : IDisposable
                 var before = reportChanges ? SnapshotNames() : null;
                 // foreground_policy may be set per step or once for the whole call.
                 var pol = st["foreground_policy"] != null ? st : a;
+                bool giveBack = (pol["foreground_policy"]?.GetValue<string>() ?? "forbid") != "allow";
+                var fgWas = giveBack ? NativeWin.GetForegroundWindow() : IntPtr.Zero;
                 var used = RunAction(el, action, text, input, pol);
                 Thread.Sleep(st["settle_ms"]?.GetValue<int>() ?? settleDefault);
+                if (giveBack) NativeWin.ForceForeground(fgWas);
                 var state = StateOfEl(el);
                 var line = new JsonObject
                 {

@@ -1,0 +1,81 @@
+{
+  "passed": false,
+  "commandExitCode": 0,
+  "baselineForeground": "0x331304",
+  "endForeground": "0x331304",
+  "violationCount": 6,
+  "violations": [
+    {
+      "timestamp": "2026-11-24T12:02:05.0842173Z",
+      "eventType": "FOREGROUND",
+      "hwnd": "0x180B70",
+      "rootHwnd": "0x180B70",
+      "pid": 29852,
+      "process": "charmap",
+      "uwpChildProcess": "",
+      "klass": "#32770",
+      "title": "\u5B57\u7B26\u6620\u5C04\u8868",
+      "isApplicationFrameHost": false
+    },
+    {
+      "timestamp": "2026-11-24T12:02:05.0968826Z",
+      "eventType": "FOCUS",
+      "hwnd": "0x60BF8",
+      "rootHwnd": "0x180B70",
+      "pid": 29852,
+      "process": "charmap",
+      "uwpChildProcess": "",
+      "klass": "#32770",
+      "title": "\u5B57\u7B26\u6620\u5C04\u8868",
+      "isApplicationFrameHost": false
+    },
+    {
+      "timestamp": "2026-11-24T12:02:05.1588079Z",
+      "eventType": "FOCUS",
+      "hwnd": "0x1A1740",
+      "rootHwnd": "0x180B70",
+      "pid": 29852,
+      "process": "charmap",
+      "uwpChildProcess": "",
+      "klass": "#32770",
+      "title": "\u5B57\u7B26\u6620\u5C04\u8868",
+      "isApplicationFrameHost": false
+    },
+    {
+      "timestamp": "2026-11-24T12:02:05.6969282Z",
+      "eventType": "FOCUS",
+      "hwnd": "0x180B70",
+      "rootHwnd": "0x180B70",
+      "pid": 0,
+      "process": "Idle",
+      "uwpChildProcess": "",
+      "klass": "",
+      "title": "",
+      "isApplicationFrameHost": false
+    },
+    {
+      "timestamp": "2026-11-24T12:02:06.3181309Z",
+      "eventType": "FOREGROUND",
+      "hwnd": "0x70B60",
+      "rootHwnd": "0x70B60",
+      "pid": 42744,
+      "process": "charmap",
+      "uwpChildProcess": "",
+      "klass": "#32770",
+      "title": "\u5B57\u7B26\u6620\u5C04\u8868",
+      "isApplicationFrameHost": false
+    },
+    {
+      "timestamp": "2026-11-24T12:02:06.3288101Z",
+      "eventType": "FOCUS",
+      "hwnd": "0x141648",
+      "rootHwnd": "0x70B60",
+      "pid": 42744,
+      "process": "charmap",
+      "uwpChildProcess": "",
+      "klass": "#32770",
+      "title": "\u5B57\u7B26\u6620\u5C04\u8868",
+      "isApplicationFrameHost": false
+    }
+  ]
+}
