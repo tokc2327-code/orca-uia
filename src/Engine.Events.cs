@@ -6,7 +6,9 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Definitions;
+using FlaUI.Core.EventHandlers;
 using FlaUI.Core.Identifiers;
+using FlaUI.UIA3;
 
 namespace OrcaUia;
 
@@ -35,10 +37,12 @@ public partial class Engine
     {
         public required string Id;
         public required AutomationElement Root;
+        public required AutomationElement?[] Keep;
         public required WatchedWindow Window;
         public required HashSet<string> Kinds;
         public required int DebounceMs;
         public required DateTimeOffset Expires;
+        public readonly object InboxGate = new();
         public readonly ConcurrentQueue<Raw> Inbox = new();
         public readonly List<Action> Unregister = [];
         public readonly Queue<Item> Journal = new();
@@ -58,15 +62,25 @@ public partial class Engine
 
         public void Push(AutomationElement sender, string kind, string? property = null, object? value = null)
         {
-            if (!Active) return;
-            Interlocked.Increment(ref RawCount);
-            if (Interlocked.Increment(ref Queued) > EventQueueLimit)
+            bool accepted = false;
+            lock (InboxGate)
             {
-                Interlocked.Decrement(ref Queued);
-                Interlocked.Increment(ref RawDropped);
-                return;
+                if (Active)
+                {
+                    Interlocked.Increment(ref RawCount);
+                    if (Interlocked.Increment(ref Queued) <= EventQueueLimit)
+                    {
+                        Inbox.Enqueue(new Raw(sender, kind, property, value, DateTimeOffset.UtcNow));
+                        accepted = true;
+                    }
+                    else
+                    {
+                        Interlocked.Decrement(ref Queued);
+                        Interlocked.Increment(ref RawDropped);
+                    }
+                }
             }
-            Inbox.Enqueue(new Raw(sender, kind, property, value, DateTimeOffset.UtcNow));
+            if (!accepted) ReleaseElement(sender, Keep);
         }
     }
 
@@ -102,27 +116,35 @@ public partial class Engine
         string? title = filter["title_contains"]?.GetValue<string>();
         if (pid is not > 0 && string.IsNullOrWhiteSpace(title))
             throw new ToolError("BAD_ARGS", "window must contain pid or title_contains");
-        var root = FindWindow(pid, title) ?? throw new ToolError("WINDOW_NOT_FOUND", "no top-level window matched");
+        var root = FindWatchWindow(pid, title) ?? throw new ToolError("WINDOW_NOT_FOUND", "no top-level window matched");
         var requested = args["kinds"] is JsonArray arr ? arr.Select(v => v?.GetValue<string>() ?? "").ToArray() : EventKinds;
         if (requested.Length == 0 || requested.Any(kind => !EventKinds.Contains(kind)))
             throw new ToolError("BAD_ARGS", "unsupported or empty kinds");
         var handle = new IntPtr(root.Properties.NativeWindowHandle.ValueOrDefault);
-        if (handle == IntPtr.Zero) throw new ToolError("WINDOW_NOT_FOUND", "window has no HWND");
+        if (handle == IntPtr.Zero)
+        {
+            ReleaseElement(root, win, lastSnapshotWindow);
+            throw new ToolError("WINDOW_NOT_FOUND", "window has no HWND");
+        }
         var debounce = Bounded(args, "debounce_ms", 80, 0, 1000);
         int lease = Bounded(args, "lease_s", 60, 1, 900);
         var watch = new Watch
         {
             Id = Guid.NewGuid().ToString("N"), Root = root,
+            Keep = [root, win, lastSnapshotWindow],
             Window = new(root.Properties.ProcessId.ValueOrDefault, root.Properties.Name.ValueOrDefault, handle.ToInt64()),
             Kinds = new HashSet<string>(requested), DebounceMs = debounce, Expires = DateTimeOffset.UtcNow.AddSeconds(lease)
         };
         try
         {
+            int regStep = 0;
+            int? failAt = int.TryParse(Environment.GetEnvironmentVariable("ORCA_UIA_TEST_INJECT_SUBSCRIBE_FAIL_STEP"), out var f) ? f : null;
             if (watch.Kinds.Overlaps(["structure", "appear", "gone"]))
             {
                 watch.Tree = EventTree(root);
                 var handler = root.RegisterStructureChangedEvent(TreeScope.Subtree, (sender, _, _) => watch.Push(sender, "structure"));
                 watch.Unregister.Add(() => root.FrameworkAutomationElement.UnregisterStructureChangedEventHandler(handler));
+                if (failAt == ++regStep) throw new InvalidOperationException("injected subscribe failure");
             }
             if (watch.Kinds.Overlaps(["property", "focus"]))
             {
@@ -136,11 +158,13 @@ public partial class Engine
                     (sender, property, value) => watch.Push(sender, property == focus ? "focus" : "property",
                         property.Name, Scalar(value)), selected.ToArray());
                 watch.Unregister.Add(() => root.FrameworkAutomationElement.UnregisterPropertyChangedEventHandler(propertyHandler));
+                if (failAt == ++regStep) throw new InvalidOperationException("injected subscribe failure");
                 if (watch.Kinds.Contains("property"))
                 {
                     var text = root.RegisterAutomationEvent(auto.EventLibrary.Text.TextChangedEvent, TreeScope.Subtree,
                         (sender, _) => watch.Push(sender, "property", "Text"));
                     watch.Unregister.Add(() => root.FrameworkAutomationElement.UnregisterAutomationEventHandler(text));
+                    if (failAt == ++regStep) throw new InvalidOperationException("injected subscribe failure");
                 }
             }
         }
@@ -191,13 +215,104 @@ public partial class Engine
         DetachEvents(watch);
     }
 
-    static int DetachEvents(Watch watch)
+    AutomationElement? FindWatchWindow(int? pid, string? title)
     {
-        watch.Active = false;
+        if (pid is > 0 && string.IsNullOrWhiteSpace(title))
+        {
+            IntPtr bestHwnd = IntPtr.Zero, fallbackHwnd = IntPtr.Zero;
+            long bestArea = -1, fallbackArea = -1;
+            NativeWin.EnumWindows((h, _) =>
+            {
+                if (!NativeWin.IsWindowVisible(h)) return true;
+                NativeWin.GetWindowThreadProcessId(h, out var wpid);
+                if (wpid != (uint)pid.Value) return true;
+                if (!NativeWin.GetWindowRect(h, out var r)) return true;
+                long w = Math.Max(0, r.R - r.L), ht = Math.Max(0, r.B - r.T);
+                long area = w * ht;
+                if (w >= 80 && ht >= 60 && area > bestArea) { bestArea = area; bestHwnd = h; }
+                if (area > fallbackArea) { fallbackArea = area; fallbackHwnd = h; }
+                return true;
+            }, IntPtr.Zero);
+            var targetHwnd = bestHwnd != IntPtr.Zero ? bestHwnd : fallbackHwnd;
+            if (targetHwnd != IntPtr.Zero)
+            {
+                try { return auto.FromHandle(targetHwnd); } catch { /* fall back to FindWindow */ }
+            }
+        }
+        return FindWindow(pid, title);
+    }
+
+    static void ReleaseCom(object? comObj)
+    {
+        if (comObj is null) return;
+        try
+        {
+            if (Marshal.IsComObject(comObj)) Marshal.ReleaseComObject(comObj);
+        }
+        catch { /* ignore already-released or disconnected COM proxies */ }
+    }
+
+    static void ReleaseElement(AutomationElement? el, params AutomationElement?[] keep)
+    {
+        if (el is null) return;
+        foreach (var k in keep)
+        {
+            if (ReferenceEquals(el, k)) return;
+        }
+        try
+        {
+            if (el.FrameworkAutomationElement is UIA3FrameworkAutomationElement uia3)
+            {
+                var native = uia3.NativeElement;
+                if (native is not null && Marshal.IsComObject(native))
+                {
+                    foreach (var k in keep)
+                    {
+                        if (k?.FrameworkAutomationElement is UIA3FrameworkAutomationElement kuia3 && ReferenceEquals(native, kuia3.NativeElement))
+                            return;
+                    }
+                    Marshal.ReleaseComObject(native);
+                }
+            }
+        }
+        catch { /* ignore already-released or disconnected COM proxies */ }
+    }
+
+    void DrainInbox(Watch watch)
+    {
+        while (watch.Inbox.TryDequeue(out var raw))
+        {
+            Interlocked.Decrement(ref watch.Queued);
+            ReleaseElement(raw.sender, watch.Root, win, lastSnapshotWindow);
+        }
+    }
+
+    int DetachEvents(Watch watch)
+    {
+        Action[] removals;
+        lock (watch.InboxGate)
+        {
+            watch.Active = false;
+            removals = watch.Unregister.ToArray();
+            watch.Unregister.Clear();
+            DrainInbox(watch);
+        }
         int failed = 0;
-        foreach (var remove in watch.Unregister)
+        foreach (var remove in removals)
             try { remove(); } catch { failed++; }
-        while (watch.Inbox.TryDequeue(out _)) { }
+        lock (watch.InboxGate)
+        {
+            DrainInbox(watch);
+        }
+        ReleaseElement(watch.LastStructure?.sender, watch.Root, win, lastSnapshotWindow);
+        watch.LastStructure = null;
+        ReleaseElement(watch.LastIdentitySignal?.sender, watch.Root, win, lastSnapshotWindow);
+        watch.LastIdentitySignal = null;
+        watch.Tree.Clear();
+        watch.Pending.Clear();
+        watch.Values.Clear();
+        watch.Journal.Clear();
+        ReleaseElement(watch.Root, win, lastSnapshotWindow);
         return failed;
     }
 
@@ -310,9 +425,23 @@ public partial class Engine
                 // RuntimeId must be read outside the legacy property cache.
                 var description = Describe(node);
                 if (!node.Properties.IsOffscreen.ValueOrDefault && description.runtime_id is string key) tree[key] = description;
-                foreach (var child in node.FindAllChildren().Take(600 - todo.Count)) todo.Push(child);
+                var children = node.FindAllChildren();
+                foreach (var child in children)
+                {
+                    if (todo.Count < 600) todo.Push(child);
+                    else ReleaseElement(child, root, win, lastSnapshotWindow);
+                }
             }
             catch { /* providers may disappear while traversing */ }
+            finally
+            {
+                if (!ReferenceEquals(node, root)) ReleaseElement(node, root, win, lastSnapshotWindow);
+            }
+        }
+        while (todo.Count > 0)
+        {
+            var leftover = todo.Pop();
+            if (!ReferenceEquals(leftover, root)) ReleaseElement(leftover, root, win, lastSnapshotWindow);
         }
         return tree;
     }
@@ -349,10 +478,28 @@ public partial class Engine
             {
                 if (raw.sender.Properties.IsPassword.Value) return null;
                 if (raw.value is not null) return raw.value;
-                if (raw.sender.Patterns.Value.IsSupported)
-                    return Scalar(raw.sender.Patterns.Value.Pattern.Value.ValueOrDefault);
-                if (raw.property == "Text" && raw.sender.Patterns.Text.IsSupported)
-                    return Scalar(raw.sender.Patterns.Text.Pattern.DocumentRange.GetText(512));
+                if (raw.sender.Patterns.Value.TryGetPattern(out var vp))
+                {
+                    try { return Scalar(vp.Value.ValueOrDefault); }
+                    finally
+                    {
+                        if (vp is FlaUI.UIA3.Patterns.ValuePattern uiaVp) ReleaseCom(uiaVp.NativePattern);
+                    }
+                }
+                if (raw.property == "Text" && raw.sender.Patterns.Text.TryGetPattern(out var tp))
+                {
+                    FlaUI.Core.ITextRange? range = null;
+                    try
+                    {
+                        range = tp.DocumentRange;
+                        return Scalar(range.GetText(512));
+                    }
+                    finally
+                    {
+                        if (range is UIA3TextRange uiaRange) ReleaseCom(uiaRange.NativeRange);
+                        if (tp is FlaUI.UIA3.Patterns.TextPattern uiaTp) ReleaseCom(uiaTp.NativePattern);
+                    }
+                }
             }
             return raw.value;
         }
@@ -365,20 +512,30 @@ public partial class Engine
         if (raw.kind == "structure")
         {
             watch.StructureCount++;
+            if (watch.LastStructure is Raw prevStruct && !ReferenceEquals(prevStruct.sender, watch.LastIdentitySignal?.sender))
+                ReleaseElement(prevStruct.sender, watch.Root, win, lastSnapshotWindow);
             watch.LastStructure = raw;
             return;
         }
         var node = Describe(raw.sender);
         string property = raw.property ?? "";
+        bool keepForIdentity = false;
         if (watch.Kinds.Overlaps(["appear", "gone"]) && property is "Name" or "IsOffscreen")
+        {
+            if (watch.LastIdentitySignal is Raw prevId && !ReferenceEquals(prevId.sender, watch.LastStructure?.sender))
+                ReleaseElement(prevId.sender, watch.Root, win, lastSnapshotWindow);
             watch.LastIdentitySignal = raw;
+            keepForIdentity = true;
+        }
         if (node.runtime_id is null)
         {
             Publish(watch, raw.ts, raw.kind, node, new { property }, "direct");
+            if (!keepForIdentity) ReleaseElement(raw.sender, watch.Root, win, lastSnapshotWindow);
             return;
         }
         var key = (node.runtime_id, raw.kind, property);
         var value = ObservedValue(raw);
+        if (!keepForIdentity) ReleaseElement(raw.sender, watch.Root, win, lastSnapshotWindow);
         if (watch.Pending.TryGetValue(key, out var old))
         {
             watch.Pending[key] = old with { After = value, Ts = raw.ts, Count = old.Count + 1 };
@@ -416,7 +573,9 @@ public partial class Engine
                 watch.Coalesced += watch.StructureCount - 1;
             }
             watch.Tree = tree;
+            ReleaseElement(watch.LastStructure?.sender, watch.Root, win, lastSnapshotWindow);
             watch.LastStructure = null;
+            ReleaseElement(watch.LastIdentitySignal?.sender, watch.Root, win, lastSnapshotWindow);
             watch.LastIdentitySignal = null;
             watch.StructureCount = 0;
         }

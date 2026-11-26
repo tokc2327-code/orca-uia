@@ -76,6 +76,8 @@
 | `NO_PATTERN_TYPING` | 当前控件没有可用于追加文本的 Value 模式或原生输入路径。 |
 | `NO_VALUE_PATTERN` | 当前控件没有可用于设置文本的 Value 模式或原生输入路径。 |
 | `NO_TOGGLE` | 控件既不支持 Toggle，也不支持 SelectionItem。 |
+| `VALUE_OUT_OF_RANGE` | `set_value` 的请求值超出控件自己的范围。消息带请求值、控件真值和换算后的百分比。 |
+| `NO_GROUND_TRUTH` | 要求 `unit="native"`，但该滑杆只讲百分比，又没有可读的控件真值来确认结果。 |
 | `USER_ACTIVE` | `allow_on_idle` 的空闲时间门槛尚未达到。 |
 | `FOREGROUND_FORBIDDEN` | 前台策略禁止这次需要接管前台的动作。 |
 | `SHOT_FAILED` | `PrintWindow` 没能渲染目标窗口。 |
@@ -123,6 +125,22 @@
 
 租约从订阅成功前设定的时点起计算，读取不续租。租约到期、目标丢失和服务退出都会尝试清理 UIA 处理器。没有查询 ID 的 `status` 只展示活跃订阅。
 
+
+## `app_act` 的 `unit` 参数（0.7.0 起）
+
+`action="set_value"` 可以带可选参数 `unit`，取值 `"auto"`（默认）| `"native"` | `"percent"`，其他值报 `BAD_ARGS`。
+
+| 值 | 含义 |
+| --- | --- |
+| `native` | 控件自己的 `Min..Max` 刻度。0..20 的滑杆写 `20` 就是滑到最右。 |
+| `percent` | 0..100。同一个滑杆写 `100` 也滑到最右。 |
+| `auto` | 等同 `native`。 |
+
+**为什么需要它。** MSAA 约定 scrollbar 与 trackbar 的可访问值一律是百分比 —— `IAccessible::get_accValue` 的 Remarks：「Numeric values returned from scroll bar and trackbar accessible objects indicate percentages. They are integers between zero (0) and one hundred (100), inclusive, but might also be a limited range」，见 <https://learn.microsoft.com/en-us/windows/win32/api/oleacc/nf-oleacc-iaccessible-get_accvalue>。Win32 公共控件 TrackBar（窗口类含 `msctls_trackbar32`）经 MSAA 代理只暴露 `ValuePattern`、不暴露 `RangeValuePattern`，所以它在 0..20 上收到 `set_value "20"` 会写 20%（真值 4），读回仍是 `"20"` —— 自洽的假成功。
+
+**现在的行为。** 对这类控件，写入前把 `native` 值换算成百分比；写入后用 `TBM_GETPOS` 读控件真值比对。不符合报 `VALUE_READBACK_MISMATCH`，超出控件范围报 `VALUE_OUT_OF_RANGE`。控件位置不会立刻到位，所以比对前会轮询到稳定或超时。有可写 `RangeValuePattern` 的控件（WPF Slider 等）不受影响，仍由 `RangeValuePattern` 分支处理。
+
+**成功回执新增字段。** `unit`、`requested`（请求的原始数字）、`applied`（读到的地面真值）、`applied_verified`、`native_value`、`native_min`、`native_max`。拿不到地面真值时 `applied` 和 `applied_verified` 不出现 —— 没验过就不会填。地面真值通过后不再追加 `warning`，避免与已验证的结果相互矛盾。
 
 ## 版本规则
 
