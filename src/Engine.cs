@@ -133,6 +133,13 @@ internal static class NativeWin
         return Process.GetProcessById(pi.dwProcessId);
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, string s);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+    // Trackbar ground truth. A common-control trackbar has no RangeValuePattern, and its
+    // ValuePattern text is a PERCENTAGE (MSAA accValue convention, see IAccessible::get_accValue:
+    // "Numeric values returned from scroll bar and trackbar accessible objects indicate percentages").
+    // TBM_GETPOS is the only way to learn what the control actually holds.
+    public const uint TBM_GETPOS = 0x0400, TBM_GETRANGEMIN = 0x0401, TBM_GETRANGEMAX = 0x0402, TBM_GETLINESIZE = 0x0418;
+    public static int TrackBarQuery(IntPtr h, uint msg) => SendMessage(h, msg, IntPtr.Zero, IntPtr.Zero).ToInt32();
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     public struct RECT { public int L, T, R, B; }
@@ -159,12 +166,18 @@ public class Recipe
     public string? Anchor; // nearest named ancestor
 }
 
-public class Engine : IDisposable
+public partial class Engine : IDisposable
 {
     readonly UIA3Automation auto = new();
     AutomationElement? win;
+    FlaUI.Core.EventHandlers.FocusChangedEventHandlerBase? focusWarmupHandler;
     readonly Dictionary<string, Recipe> recipes = new();
     int idCounter;
+
+    void EnsureFocusWarmup()
+    {
+        focusWarmupHandler ??= auto.RegisterFocusChangedEvent(_ => { });
+    }
 
     static readonly HashSet<ControlType> Interactive = new()
     {
@@ -189,7 +202,8 @@ public class Engine : IDisposable
         "app_warmup" => Warmup(a),
         "app_window" => Window(a),
         "app_cdp" => Cdp(a),
-        "app_snapshot" => Snapshot(a),
+        "app_snapshot" => a["since"] is null ? Snapshot(a) : SnapshotDelta(a),
+        "app_events" => Events(a),
         "app_act" => Act(a),
         "app_wait" => Wait(a),
         "app_shot" => Shot(a),
@@ -213,21 +227,41 @@ public class Engine : IDisposable
     {
         AutomationElement? best = null;
         long bestArea = -1;
-        foreach (var w in auto.GetDesktop().FindAllChildren())
+        var desktop = auto.GetDesktop();
+        var keepBase = new List<AutomationElement?> { win, lastSnapshotWindow };
+        foreach (var watch in watches.Values) keepBase.Add(watch.Root);
+        var keepArr = keepBase.ToArray();
+        try
         {
-            string title; int wpid; Rectangle r;
-            try
+            foreach (var w in desktop.FindAllChildren())
             {
-                title = w.Properties.Name.ValueOrDefault ?? "";
-                wpid = w.Properties.ProcessId.ValueOrDefault;
-                r = w.BoundingRectangle;
+                string title; int wpid; Rectangle r;
+                try
+                {
+                    title = w.Properties.Name.ValueOrDefault ?? "";
+                    wpid = w.Properties.ProcessId.ValueOrDefault;
+                    r = w.BoundingRectangle;
+                }
+                catch (Exception) { ReleaseElement(w, keepArr); continue; }
+                if (pid.HasValue && wpid != pid.Value) { ReleaseElement(w, keepArr); continue; }
+                if (titleContains != null && !title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)) { ReleaseElement(w, keepArr); continue; }
+                if (skipTiny && (r.Width < 80 || r.Height < 60)) { ReleaseElement(w, keepArr); continue; } // tray stubs / IME / message windows
+                long area = (long)Math.Max(r.Width, 0) * Math.Max(r.Height, 0);
+                if (area > bestArea)
+                {
+                    if (best != null) ReleaseElement(best, keepArr);
+                    bestArea = area; best = w;
+                }
+                else
+                {
+                    ReleaseElement(w, keepArr);
+                }
             }
-            catch (Exception) { continue; }
-            if (pid.HasValue && wpid != pid.Value) continue;
-            if (titleContains != null && !title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)) continue;
-            if (skipTiny && (r.Width < 80 || r.Height < 60)) continue; // tray stubs / IME / message windows
-            long area = (long)Math.Max(r.Width, 0) * Math.Max(r.Height, 0);
-            if (area > bestArea) { bestArea = area; best = w; }
+        }
+        finally
+        {
+            var deskKeep = best is null ? keepArr : keepArr.Append(best).ToArray();
+            ReleaseElement(desktop, deskKeep);
         }
         return best;
     }
@@ -266,7 +300,7 @@ public class Engine : IDisposable
             NativeWin.MakeNonActivating(hw, out _);
         }
         // Subscribing to UIA events makes UiaClientsAreListening() true -> Chromium builds its tree.
-        auto.RegisterFocusChangedEvent(_ => { });
+        EnsureFocusWarmup();
         var sw = Stopwatch.StartNew();
         int nodes = (a["preload"]?.GetValue<bool>() ?? true) ? Preload(a["preload_ms"]?.GetValue<int>() ?? 1500) : 0;
         return Json(new
@@ -299,7 +333,7 @@ public class Engine : IDisposable
             if (w != null)
             {
                 win = w; recipes.Clear();
-                auto.RegisterFocusChangedEvent(_ => { });
+                EnsureFocusWarmup();
                 // Report the window owner's pid, not the launcher's: launchers (and
                 // packaged apps) exit at once and a different process owns the window.
                 // Property reads can throw on a just-created element; fall back to the launcher's pid.
@@ -732,6 +766,7 @@ public class Engine : IDisposable
         int emitted = 0;
         var sw = Stopwatch.StartNew();
         Walk(Win(), 0, null, interactiveOnly, maxNodes, sb, ref emitted);
+        MarkSnapshot();
         sb.Insert(0, $"# nodes={emitted} elapsed_ms={sw.ElapsedMilliseconds} (ids valid until next snapshot)\n");
         return sb.ToString();
     }
@@ -875,7 +910,8 @@ public class Engine : IDisposable
         // afterwards so the person who was typing keeps it (unless policy says otherwise).
         bool giveBack = (a["foreground_policy"]?.GetValue<string>() ?? "forbid") != "allow";
         var fgWas = giveBack ? NativeWin.GetForegroundWindow() : IntPtr.Zero;
-        var used = RunAction(el, action, text, input, a);
+        var extra = new JsonObject();
+        var used = RunAction(el, action, text, input, a, a["unit"]?.GetValue<string>(), extra);
 
         Thread.Sleep(a["settle_ms"]?.GetValue<int>() ?? 150);
         if (giveBack) NativeWin.ForceForeground(fgWas);
@@ -889,8 +925,14 @@ public class Engine : IDisposable
             ["state"] = st,
             ["elapsed_ms"] = sw.ElapsedMilliseconds
         };
-        var warn = TypeWarning(action, text, st);
-        if (warn != null) r["warning"] = warn;
+        foreach (var kv in extra) r[kv.Key] = kv.Value?.DeepClone();
+        // Ground truth has already judged the write (and the pattern echoes percent, not the value
+        // asked for), so the text-comparison warning would only contradict a verified result.
+        if (extra["applied_verified"]?.GetValue<bool>() != true)
+        {
+            var warn = TypeWarning(action, text, st);
+            if (warn != null) r["warning"] = warn;
+        }
         if (before != null) r["changed"] = Diff(before);
         return r.ToJsonString();
     }
@@ -1118,32 +1160,57 @@ public class Engine : IDisposable
 
     // ---------- one action, no snapshot bookkeeping ----------
 
-    // Plain Win32 edit controls answer WM_SETTEXT / EM_REPLACESEL across processes, with no
-    // focus change and no keystrokes. Chromium/Electron editors are not HWNDs, so their
-    // NativeWindowHandle is 0 and this returns false.
-    static bool TryNativeText(AutomationElement el, string text, bool append, out string used)
-    {
-        used = "";
-        IntPtr h;
-        try { h = el.Properties.NativeWindowHandle.ValueOrDefault; } catch (Exception) { return false; }
-        if (h == IntPtr.Zero) return false;
-        if (append)
-        {
-            NativeWin.SendMessage(h, 0x00C2 /* EM_REPLACESEL */, (IntPtr)1, text);
-            used = "em_replacesel";
-        }
-        else
-        {
-            NativeWin.SendMessage(h, 0x000C /* WM_SETTEXT */, IntPtr.Zero, text);
-            used = "wm_settext";
-        }
-        return true;
-    }
-
     // Never touch the real pointer or keyboard unless the caller says input:"physical".
     // The default path uses UIA patterns only, so a sequence can run while the person keeps
     // using the machine. Returns the path that was actually taken, for the receipt.
-    static string RunAction(AutomationElement el, string action, string? text, string input, JsonObject? policy = null)
+    // ---------- set_value ground truth ----------
+
+    // What the control really holds, read from the control itself rather than from the pattern
+    // that just echoed our request. Only common-control trackbars have such a back channel.
+    sealed class GroundTruth
+    {
+        public IntPtr Hwnd;
+        public int Value, Min, Max, LineSize;
+    }
+
+    static GroundTruth? TrackBarTruth(AutomationElement el)
+    {
+        try
+        {
+            var h = new IntPtr(el.Properties.NativeWindowHandle.ValueOrDefault);
+            if (h == IntPtr.Zero) return null;
+            var cls = new StringBuilder(256);
+            if (NativeWin.GetClassName(h, cls, 256) == 0) return null;
+            if (cls.ToString().IndexOf("msctls_trackbar32", StringComparison.OrdinalIgnoreCase) < 0) return null;
+            return new GroundTruth
+            {
+                Hwnd = h,
+                Value = NativeWin.TrackBarQuery(h, NativeWin.TBM_GETPOS),
+                Min = NativeWin.TrackBarQuery(h, NativeWin.TBM_GETRANGEMIN),
+                Max = NativeWin.TrackBarQuery(h, NativeWin.TBM_GETRANGEMAX),
+                LineSize = NativeWin.TrackBarQuery(h, NativeWin.TBM_GETLINESIZE)
+            };
+        }
+        catch (Exception) { return null; }
+    }
+
+    static bool LooksSliderLike(AutomationElement el)
+    {
+        try
+        {
+            var t = el.Properties.ControlType.ValueOrDefault.ToString();
+            return t.IndexOf("Slider", StringComparison.OrdinalIgnoreCase) >= 0
+                || t.IndexOf("Spin", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        catch (Exception) { return false; }
+    }
+
+    static bool TryNum(string s, out double v) =>
+        double.TryParse(s, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out v)
+        && double.IsFinite(v);
+
+    static string RunAction(AutomationElement el, string action, string? text, string input, JsonObject? policy = null,
+        string? unitRaw = null, JsonObject? extra = null)
     {
         bool physical = string.Equals(input, "physical", StringComparison.OrdinalIgnoreCase);
         switch (action)
@@ -1178,21 +1245,155 @@ public class Engine : IDisposable
                 return pre + "physical";
             case "set_value":
                 if (text == null) throw new ToolError("BAD_ARGS", "text required");
+                if (physical)
+                {
+                    AssertForegroundAllowed(policy, "app_act.set_value(physical)");
+                    el.Focus();
+                    Keyboard.Type(text);
+                    var physicalValue = el.Patterns.Value.IsSupported ? el.Patterns.Value.Pattern.Value.ValueOrDefault : null;
+                    if (physicalValue != text) throw new ToolError("VALUE_READBACK_MISMATCH", "physical input did not read back the requested value");
+                    return "physical";
+                }
                 if (el.Patterns.Value.IsSupported && !el.Patterns.Value.Pattern.IsReadOnly.ValueOrDefault)
                 {
-                    el.Patterns.Value.Pattern.SetValue(text);
+                    var unit = (unitRaw ?? "auto").Trim().ToLowerInvariant();
+                    if (unit != "auto" && unit != "native" && unit != "percent")
+                        throw new ToolError("BAD_ARGS", $"unit must be auto|native|percent, got \"{unitRaw}\"");
+                    var truth = TrackBarTruth(el);
+                    if (truth != null && truth.Max <= truth.Min && LooksSliderLike(el))
+                        throw new ToolError("NO_GROUND_TRUTH",
+                            $"slider has degenerate trackbar range {truth.Min}..{truth.Max}, so set_value cannot convert or verify the write",
+                            "ensure the control is initialized with Maximum > Minimum before calling set_value");
+                    if (unit == "native" && truth == null && LooksSliderLike(el) && TryNum(text, out _) && !el.Patterns.RangeValue.IsSupported)
+                        throw new ToolError("NO_GROUND_TRUTH",
+                            "unit=native was asked for a slider whose ValuePattern speaks percent, and this element has no readable trackbar position to confirm the result",
+                            "use unit=percent, or action=type with input:\"physical\"");
+                      // A trackbar answers its ValuePattern in percent (MSAA convention), while a caller
+                    // naming a control means the value that control shows. Default to the control's own
+                    // scale, convert for the write, and check the result against TBM_GETPOS - the echo
+                    // of our own request proves nothing (set 20 on a 0..20 bar used to land on 4 and
+                    // still read back "20").
+                    double requested;
+                    var numeric = TryNum(text, out requested);
+                    var effective = unit == "auto" ? "native" : unit;
+                    var writeText = text;
+                    var converted = false;
+                    double targetNative = double.NaN;
+                    double nativeTol = 0.5d;
+                    if (truth != null && numeric && truth.Max > truth.Min)
+                    {
+                        var span = (double)truth.Max - truth.Min;
+                        var halfStep = truth.LineSize > 0 ? truth.LineSize / 2d : 0.5d;
+                        nativeTol = Math.Max(0.5d, span / 100d) + halfStep;
+                        if (effective == "native")
+                        {
+                            targetNative = requested;
+                            var pct = (requested - truth.Min) * 100d / span;
+                            if (requested < truth.Min || requested > truth.Max)
+                                throw new ToolError("VALUE_OUT_OF_RANGE",
+                                    $"{requested} is outside this control's {truth.Min}..{truth.Max}; the write would have to be {pct:0.#}%",
+                                    "read the range from a snapshot, or pass unit=percent to write the percentage itself");
+                            writeText = pct.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture);
+                            converted = true;
+                        }
+                        else
+                        {
+                            if (requested < 0d || requested > 100d)
+                                throw new ToolError("VALUE_OUT_OF_RANGE",
+                                    $"unit=percent accepts 0..100, got {requested}");
+                            targetNative = Math.Round(requested * span / 100d) + truth.Min;
+                        }
+                    }
+                    el.Patterns.Value.Pattern.SetValue(writeText);
                     bool pwRead;
                     try { pwRead = el.Properties.IsPassword.ValueOrDefault; } catch (Exception) { pwRead = false; }
                     var read = el.Patterns.Value.Pattern.Value.ValueOrDefault;
-                    if (pwRead || read == text) return "value";
-                    // ValuePattern took the write and dropped it (Chromium contenteditable does
-                    // this). A plain Win32 edit control still answers WM_SETTEXT, which needs no
-                    // focus and no keystrokes.
-                    if (TryNativeText(el, text, append: false, out var nv)) return nv;
-                    return "value_ignored";
+                    if (!converted && !pwRead && read != writeText)
+                        throw new ToolError("VALUE_READBACK_MISMATCH", $"ValuePattern read back \\\"{Trunc(read)}\\\" after setting the requested value");
+                    // A trackbar applies the write a little later than it echoes it: read the position
+                    // until it settles on the target or stops moving, otherwise we judge a stale 16.
+                    if (truth != null && numeric && !double.IsNaN(targetNative))
+                    {
+                        var settled = truth.Value;
+                        for (var i = 0; i < 20; i++)
+                        {
+                            if (Math.Abs(settled - targetNative) <= 0.5d) break;
+                            Thread.Sleep(50);
+                            settled = NativeWin.TrackBarQuery(truth.Hwnd, NativeWin.TBM_GETPOS);
+                            if (i >= 2 && settled == truth.Value) break;
+                            truth.Value = settled;
+                        }
+                        truth.Value = NativeWin.TrackBarQuery(truth.Hwnd, NativeWin.TBM_GETPOS);
+                    }
+                    if (truth != null && numeric && !double.IsNaN(targetNative) && Math.Abs(truth.Value - targetNative) > nativeTol)
+                        throw new ToolError("VALUE_READBACK_MISMATCH",
+                            $"trackbar holds {truth.Value} on its {truth.Min}..{truth.Max} scale, but {effective} {requested} means {targetNative} (tolerance {nativeTol:0.##})",
+                            effective == "percent"
+                                ? "the control's percentage range may not be 0..100; pass unit=native and the control's own value"
+                                : "the control snapped to another value - check its SmallChange, or pass unit=percent");
+                    if (extra != null && truth != null && numeric && !double.IsNaN(targetNative))
+                    {
+                        extra["unit"] = effective;
+                        extra["requested"] = requested;
+                        extra["applied"] = truth.Value;
+                        extra["applied_verified"] = true;
+                        extra["native_value"] = truth.Value;
+                        extra["native_min"] = truth.Min;
+                        extra["native_max"] = truth.Max;
+                    }
+                    else if (extra != null && truth != null)
+                    {
+                        extra["applied_verified"] = false;
+                        extra["warning"] = "cannot confirm trackbar ground truth (degenerate range or non-numeric value)";
+                    }
+                    return "value";
                 }
-                if (TryNativeText(el, text, append: false, out var nu)) return nu;
-                throw new ToolError("NO_VALUE_PATTERN", "element has no writable Value pattern", "use action=type with input:\"physical\"");
+                if (el.Patterns.RangeValue.IsSupported && !el.Patterns.RangeValue.Pattern.IsReadOnly.ValueOrDefault)
+                {
+                    var unit = (unitRaw ?? "auto").Trim().ToLowerInvariant();
+                    if (unit != "auto" && unit != "native" && unit != "percent")
+                        throw new ToolError("BAD_ARGS", $"unit must be auto|native|percent, got \"{unitRaw}\"");
+                    if (!TryNum(text, out var requested) || !double.IsFinite(requested))
+                        throw new ToolError("BAD_ARGS", "RangeValuePattern requires a numeric text value");
+                    var range = el.Patterns.RangeValue.Pattern;
+                    var min = range.Minimum.ValueOrDefault;
+                    var max = range.Maximum.ValueOrDefault;
+                    var small = range.SmallChange.ValueOrDefault;
+                    var tolerance = double.IsFinite(small) ? Math.Max(Math.Abs(small) / 2d, 1e-9) : 1e-9;
+                    var effective = unit == "auto" ? "native" : unit;
+                    double target;
+                    if (effective == "percent")
+                    {
+                        if (requested < -0.5d || requested > 100.5d)
+                            throw new ToolError("VALUE_OUT_OF_RANGE", $"unit=percent accepts 0..100, got {requested}");
+                        target = Math.Round(requested * (max - min) / 100d) + min;
+                    }
+                    else
+                    {
+                        target = requested;
+                    }
+                    if (target < min - tolerance || target > max + tolerance)
+                        throw new ToolError("VALUE_OUT_OF_RANGE", $"{target} is outside this control's {min}..{max}");
+                    range.SetValue(min <= max ? Math.Clamp(target, min, max) : target);
+                    var read = range.Value.ValueOrDefault;
+                    if (Math.Abs(read - target) > tolerance)
+                        throw new ToolError("VALUE_READBACK_MISMATCH",
+                            effective == "percent"
+                                ? $"RangeValuePattern read back {read} on {min}..{max}, but percent {requested} means {target} (tolerance {tolerance})"
+                                : $"RangeValuePattern read back {read} after requesting {requested} (tolerance {tolerance})");
+                    if (extra != null)
+                    {
+                        extra["unit"] = effective;
+                        extra["requested"] = requested;
+                        extra["applied"] = read;
+                        extra["applied_verified"] = true;
+                        extra["native_value"] = read;
+                        extra["native_min"] = min;
+                        extra["native_max"] = max;
+                    }
+                    return "range_value";
+                }
+                throw new ToolError("UNSUPPORTED_PATTERN", "element has no writable ValuePattern or RangeValuePattern", "use action=type with input:\"physical\", or app_cdp for Chromium/Electron");
             case "type":
                 if (text == null) throw new ToolError("BAD_ARGS", "text required");
                 if (physical)
@@ -1200,24 +1401,26 @@ public class Engine : IDisposable
                     AssertForegroundAllowed(policy, "app_act.type(physical)");
                     el.Focus();
                     Keyboard.Type(text);
+                    if (el.Patterns.Value.IsSupported)
+                    {
+                        var typedValue = el.Patterns.Value.Pattern.Value.ValueOrDefault ?? "";
+                        if (!typedValue.Contains(text, StringComparison.Ordinal)) throw new ToolError("VALUE_READBACK_MISMATCH", "physical text was not present in ValuePattern readback");
+                    }
                     return "physical";
                 }
                 if (el.Patterns.Value.IsSupported && !el.Patterns.Value.Pattern.IsReadOnly.ValueOrDefault)
                 {
                     bool pw;
                     try { pw = el.Properties.IsPassword.ValueOrDefault; } catch (Exception) { pw = false; }
-                    if (pw) throw new ToolError("PASSWORD_FIELD", "password inputs cannot be typed into without real keystrokes",
-                        "use action=set_value; the value reads back masked");
+                    if (pw) throw new ToolError("PASSWORD_FIELD", "password inputs cannot be typed into without real keystrokes", "use input:\"physical\"");
                     var cur = el.Patterns.Value.Pattern.Value.ValueOrDefault ?? "";
-                    el.Patterns.Value.Pattern.SetValue(cur + text);
-                    if (el.Patterns.Value.Pattern.Value.ValueOrDefault != cur + text && TryNativeText(el, text, append: true, out var nv))
-                        return nv;
+                    var expected = cur + text;
+                    el.Patterns.Value.Pattern.SetValue(expected);
+                    var read = el.Patterns.Value.Pattern.Value.ValueOrDefault ?? "";
+                    if (read != expected) throw new ToolError("VALUE_READBACK_MISMATCH", $"ValuePattern read back \\\"{Trunc(read)}\\\" after typing");
                     return "value_append";
                 }
-                if (TryNativeText(el, text, append: true, out var na)) return na;
-                throw new ToolError("NO_PATTERN_TYPING", "element has no writable Value pattern, so typing needs real keystrokes",
-                    "pass input:\"physical\" to type into the focused window");
-            case "press":
+                throw new ToolError("UNSUPPORTED_PATTERN", "element has no writable ValuePattern for text input", "pass input:\"physical\" or use app_cdp for Chromium/Electron");            case "press":
                 if (text == null || !Enum.TryParse<VirtualKeyShort>(text, true, out var key))
                     throw new ToolError("BAD_ARGS", "text must be a VirtualKeyShort name, e.g. ENTER, TAB, ESCAPE");
                 if (!physical) throw new ToolError("PHYSICAL_ONLY", "a key press is real input", "pass input:\"physical\" to send it");
@@ -1274,7 +1477,9 @@ public class Engine : IDisposable
                 var pol = st["foreground_policy"] != null ? st : a;
                 bool giveBack = (pol["foreground_policy"]?.GetValue<string>() ?? "forbid") != "allow";
                 var fgWas = giveBack ? NativeWin.GetForegroundWindow() : IntPtr.Zero;
-                var used = RunAction(el, action, text, input, pol);
+                var stepExtra = new JsonObject();
+                var used = RunAction(el, action, text, input, pol,
+                    st["unit"]?.GetValue<string>() ?? a["unit"]?.GetValue<string>(), stepExtra);
                 Thread.Sleep(st["settle_ms"]?.GetValue<int>() ?? settleDefault);
                 if (giveBack) NativeWin.ForceForeground(fgWas);
                 var state = StateOfEl(el);
@@ -1290,7 +1495,8 @@ public class Engine : IDisposable
                     ["elapsed_ms"] = sw.ElapsedMilliseconds
                 };
                 var warn = TypeWarning(action, text, state);
-                if (warn != null) line["warning"] = warn;
+                if (stepExtra["applied_verified"]?.GetValue<bool>() != true && warn != null) line["warning"] = warn;
+                foreach (var kv in stepExtra) line[kv.Key] = kv.Value?.DeepClone();
                 if (before != null) line["changed"] = Diff(before);
                 sb.Append(line.ToJsonString()).Append('\n');
                 ok++;
@@ -1406,7 +1612,16 @@ public class Engine : IDisposable
     AutomationElement Win() => win ?? throw new ToolError("NOT_ATTACHED", "call app_launch or app_attach first");
     static string Trunc(string? s) => s == null ? "" : (s.Length > 60 ? s[..60] + "…" : s).Replace("\n", " ");
     static string Json(object o) => JsonSerializer.Serialize(o);
-    public void Dispose() => auto.Dispose();
+    public void Dispose()
+    {
+        DisposeEvents();
+        if (focusWarmupHandler is not null)
+        {
+            try { auto.UnregisterFocusChangedEvent(focusWarmupHandler); } catch { }
+            focusWarmupHandler = null;
+        }
+        auto.Dispose();
+    }
 }
 
 public static class Tools
@@ -1425,6 +1640,17 @@ public static class Tools
     static JsonObject S(string d) => new() { ["type"] = "string", ["description"] = d };
     static JsonObject I(string d) => new() { ["type"] = "integer", ["description"] = d };
     static JsonObject B(string d) => new() { ["type"] = "boolean", ["description"] = d };
+
+    static JsonObject EventDefinition() => Tool("app_events", "Subscribe to window-scoped UIA events, poll a cursor, inspect status or unsubscribe.",
+        new JsonObject {
+            ["action"] = S("subscribe|poll|status|unsubscribe"),
+            ["window"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject {
+                ["pid"] = I("window pid"), ["title_contains"] = S("window title substring") } },
+            ["kinds"] = new JsonObject { ["type"] = "array", ["items"] = S("structure|property|appear|gone|focus") },
+            ["debounce_ms"] = I("0..1000; default 80"), ["lease_s"] = I("1..900; default 60"),
+            ["subscription_id"] = S("subscription ID"), ["since"] = S("subscription cursor"),
+            ["limit"] = I("1..256; default 64"), ["max_bytes"] = I("512..262144; default 16384"),
+        }, "action");
 
     public static JsonArray Definitions() => new()
     {
@@ -1451,7 +1677,8 @@ public static class Tools
                 ["clear_first"] = B("empty the box first, default false"), ["url_contains"] = S("page url filter"),
                 ["title_contains"] = S("page title filter"), ["timeout_ms"] = I("default 15000") }),
         Tool("app_snapshot", "Return the control tree as text with snapshot-scoped ids (e1, e2...). Ids die on the next snapshot.",
-            new JsonObject { ["interactive_only"] = B("default true"), ["max_nodes"] = I("default 600") }),
+            new JsonObject { ["interactive_only"] = B("default true"), ["max_nodes"] = I("default 600"), ["since"] = S("optional event cursor; returns JSON delta") }),
+        EventDefinition(),
         Tool("app_act", "Act on an element, addressed either by a snapshot id or by a live target {type|name|name_contains|aid}[+index] - a target is looked up in the live tree each time, so it survives earlier steps. Pass steps[] to run a sequence in ONE call; every step reports post-state and (changes, default true) what appeared/vanished, so no screenshot and no re-snapshot is needed between steps.",
             new JsonObject {
                 ["id"] = S("e-id from the latest snapshot"),
@@ -1464,6 +1691,7 @@ public static class Tools
                 ["index"] = I("0-based pick when several elements match; omit to require a unique match"),
                 ["action"] = S("click|set_value|type|press|toggle (single-step form)"),
                 ["text"] = S("value / text / key name"),
+                ["unit"] = S("set_value only: auto (default) | native (the control's own Min..Max) | percent (0..100). Common-control trackbars (msctls_trackbar32) answer ValuePattern in percent, so auto treats them as percent and verifies against TBM_GETPOS; the receipt then carries unit/requested/applied/applied_verified/native_value/native_min/native_max"),
                 ["steps"] = new JsonObject { ["type"] = "array", ["description"] = "sequence: [{action|wait, id|target|type|name|name_contains|aid|index, text, settle_ms}]" },
                 ["changes"] = B("report appeared/removed/enabled-changed nodes; default true for steps, false for a single act"),
                 ["stop_on_error"] = B("stop the sequence at the first failed step; default true"),
@@ -1476,3 +1704,5 @@ public static class Tools
             new JsonObject { ["path"] = S("absolute .png path to write"), ["title_contains"] = S("window title substring"), ["pid"] = I("process id") }, "path"),
     };
 }
+
+
