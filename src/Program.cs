@@ -38,6 +38,7 @@ static void Run(BlockingCollection<string?> queue)
     while (true)
     {
         Pump.Drain();
+        engine.EventsTick();
         if (!queue.TryTake(out var raw, 10))
         {
             if (queue.IsCompleted) { Pump.Drain(); break; }

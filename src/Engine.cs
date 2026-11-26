@@ -159,7 +159,7 @@ public class Recipe
     public string? Anchor; // nearest named ancestor
 }
 
-public class Engine : IDisposable
+public partial class Engine : IDisposable
 {
     readonly UIA3Automation auto = new();
     AutomationElement? win;
@@ -189,7 +189,8 @@ public class Engine : IDisposable
         "app_warmup" => Warmup(a),
         "app_window" => Window(a),
         "app_cdp" => Cdp(a),
-        "app_snapshot" => Snapshot(a),
+        "app_snapshot" => a["since"] is null ? Snapshot(a) : SnapshotDelta(a),
+        "app_events" => Events(a),
         "app_act" => Act(a),
         "app_wait" => Wait(a),
         "app_shot" => Shot(a),
@@ -732,6 +733,7 @@ public class Engine : IDisposable
         int emitted = 0;
         var sw = Stopwatch.StartNew();
         Walk(Win(), 0, null, interactiveOnly, maxNodes, sb, ref emitted);
+        MarkSnapshot();
         sb.Insert(0, $"# nodes={emitted} elapsed_ms={sw.ElapsedMilliseconds} (ids valid until next snapshot)\n");
         return sb.ToString();
     }
@@ -1406,7 +1408,7 @@ public class Engine : IDisposable
     AutomationElement Win() => win ?? throw new ToolError("NOT_ATTACHED", "call app_launch or app_attach first");
     static string Trunc(string? s) => s == null ? "" : (s.Length > 60 ? s[..60] + "…" : s).Replace("\n", " ");
     static string Json(object o) => JsonSerializer.Serialize(o);
-    public void Dispose() => auto.Dispose();
+    public void Dispose() { DisposeEvents(); auto.Dispose(); }
 }
 
 public static class Tools
@@ -1425,6 +1427,17 @@ public static class Tools
     static JsonObject S(string d) => new() { ["type"] = "string", ["description"] = d };
     static JsonObject I(string d) => new() { ["type"] = "integer", ["description"] = d };
     static JsonObject B(string d) => new() { ["type"] = "boolean", ["description"] = d };
+
+    static JsonObject EventDefinition() => Tool("app_events", "Subscribe to window-scoped UIA events, poll a cursor, inspect status or unsubscribe.",
+        new JsonObject {
+            ["action"] = S("subscribe|poll|status|unsubscribe"),
+            ["window"] = new JsonObject { ["type"] = "object", ["properties"] = new JsonObject {
+                ["pid"] = I("window pid"), ["title_contains"] = S("window title substring") } },
+            ["kinds"] = new JsonObject { ["type"] = "array", ["items"] = S("structure|property|appear|gone|focus") },
+            ["debounce_ms"] = I("0..1000; default 80"), ["lease_s"] = I("1..900; default 60"),
+            ["subscription_id"] = S("subscription ID"), ["since"] = S("subscription cursor"),
+            ["limit"] = I("1..256; default 64"), ["max_bytes"] = I("512..262144; default 16384"),
+        }, "action");
 
     public static JsonArray Definitions() => new()
     {
@@ -1451,7 +1464,8 @@ public static class Tools
                 ["clear_first"] = B("empty the box first, default false"), ["url_contains"] = S("page url filter"),
                 ["title_contains"] = S("page title filter"), ["timeout_ms"] = I("default 15000") }),
         Tool("app_snapshot", "Return the control tree as text with snapshot-scoped ids (e1, e2...). Ids die on the next snapshot.",
-            new JsonObject { ["interactive_only"] = B("default true"), ["max_nodes"] = I("default 600") }),
+            new JsonObject { ["interactive_only"] = B("default true"), ["max_nodes"] = I("default 600"), ["since"] = S("optional event cursor; returns JSON delta") }),
+        EventDefinition(),
         Tool("app_act", "Act on an element, addressed either by a snapshot id or by a live target {type|name|name_contains|aid}[+index] - a target is looked up in the live tree each time, so it survives earlier steps. Pass steps[] to run a sequence in ONE call; every step reports post-state and (changes, default true) what appeared/vanished, so no screenshot and no re-snapshot is needed between steps.",
             new JsonObject {
                 ["id"] = S("e-id from the latest snapshot"),

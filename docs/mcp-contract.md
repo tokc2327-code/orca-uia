@@ -2,7 +2,7 @@
 
 ## 传输与初始化
 
-服务器通过标准输入和标准输出传输 JSON-RPC 2.0。每行一条 UTF-8 JSON 消息，输出无 BOM。客户端发送带 `id` 的 `initialize`，然后发送无 `id` 的 `notifications/initialized`，服务端对通知不回复。实测请求 `2025-03-26` 返回 `2025-03-26`，省略该字段也返回这个值。当前实现原样回显客户端提供的版本字符串，未校验支持范围。`initialize` 返回 `protocolVersion`、`capabilities: {"tools":{}}` 和 `serverInfo: {"name":"orca-uia","version":"0.5.0"}`。
+服务器通过标准输入和标准输出传输 JSON-RPC 2.0。每行一条 UTF-8 JSON 消息，输出无 BOM。客户端发送带 `id` 的 `initialize`，然后发送无 `id` 的 `notifications/initialized`，服务端对通知不回复。实测请求 `2025-03-26` 返回 `2025-03-26`，省略该字段也返回这个值。当前实现原样回显客户端提供的版本字符串，未校验支持范围。`initialize` 返回 `protocolVersion`、`capabilities: {"tools":{}}` 和 `serverInfo: {"name":"orca-uia","version":"0.6.0"}`。
 
 `tools/list` 返回 `{"tools":[{"name":…,"description":…,"inputSchema":…},…]}`。`tools/call` 接收 `params.name` 和 `params.arguments`。工具结果为 `{"content":[{"type":"text","text":…}],"isError":false}`。下表中的对象都是 **`text` 内编码的 JSON**。`app_snapshot` 和多步 `app_act` 使用下述文本格式。
 
@@ -89,6 +89,40 @@
 | `CDP_NO_ELEMENT` | 点击时，选择器没有命中元素。 |
 | `CDP_TIMEOUT` | 轮询期间选择器一直没有命中元素。 |
 | `INTERNAL` | 工具或单步动作抛出未归类的异常。 |
+
+## V0.6 事件订阅与快照增量
+
+服务端版本为 `0.6.0`。事件能力加入一个工具 `app_events`。原有工具调用方式保持兼容，`app_snapshot` 没有 `since` 时继续返回原快照文本。工具总数为 10。
+
+| action | 参数 | 内容 |
+| --- | --- | --- |
+| `subscribe` | `window`，含 `pid` 或 `title_contains`。可选 `kinds`、`debounce_ms`（默认 80，范围 0–1000）、`lease_s`（默认 60，范围 1–900） | 返回 `subscription_id`、初始 `cursor`、窗口身份、过期时间和已注册处理器数。最多四个活跃订阅。 |
+| `poll` | `since` 或 `subscription_id`。可选 `limit`（默认 64，范围 1–256）、`max_bytes`（默认 16384，范围 512–262144） | 返回 `events`、下一页 `cursor`、本页 `unmatched` 计数和 `has_more`。不等待未来事件。 |
+| `status` | 可选 `subscription_id` | 有 ID 时返回本订阅计数，无 ID 时返回活跃订阅与处理器数量。 |
+| `unsubscribe` | `subscription_id` | 停止订阅，返回实际移除的处理器数量。 |
+
+`kinds` 默认包括 `structure`、`property`、`appear`、`gone`、`focus`。焦点由窗口子树内的 UIA `HasKeyboardFocus` 属性通知提供。UIA 回调只入队，窗口身份、名称和文本读回在原 STA 上解析。密码状态无法明确判定时，值与文本留空。属性通知按节点、类别和属性合并，记首次已知旧值、最后新值，标 `merged`。结构通知触发有限子树复读，`appear` 和 `gone` 标 `reconciled`。去抖窗口内出现又消失的节点可能不出现在净变化中。事件流不能作为逐个中间状态的业务审计。
+
+每个事件有 `seq`、`ts`、`kind`、`window`、`node`、`change` 和 `confidence`。使用 `seq` 排序和去重。回调采样的 `ts` 可能因合并或结构复读而与队列顺序不同。只有窗口及节点身份与最近完整快照唯一对应时，`node.id` 才携带该快照的 `eN`，`node.snapshot` 标出服务器内部快照代数。对不上的事件保留 `node.unmatched: true`。
+
+`app_snapshot { since: "<cursor>" }` 返回 `changes`、`cursor`、`unmatched` 和 `has_more`。只输出出现、消失和属性变化，游标仍跨过同一订阅中的其他事件。增量查询不会重建 `eN` 映射。完整快照没有订阅限制，也不会清空事件日志。
+
+游标形态为 `<subscription_id>:<seq>`，从上次已消费序号的下一项读取。重复使用同一游标可以重放尚在日志中的页面。队列最多 1024 条原始通知、日志最多 2048 条已输出事件。游标落后于日志保留窗口，或回调队列发生丢弃时，返回 `EVENTS_CURSOR_STALE`，需要重新订阅并获取完整快照。单条事件超过 `max_bytes` 时返回 `EVENTS_MAX_BYTES`，游标保持原位。字节限制适用于工具返回的内层 JSON，外层 JSON-RPC 编码可能更大。
+
+| 错误码 | 含义 |
+| --- | --- |
+| `EVENTS_BUSY` | 活跃订阅达到上限。 |
+| `EVENTS_UNKNOWN_SUBSCRIPTION` | 无有效订阅 ID，或过旧的结束记录已清除。 |
+| `EVENTS_BAD_CURSOR` | 格式错误、与订阅不符或序号超前。 |
+| `EVENTS_CURSOR_STALE` | 日志溢出或通知丢失，需要重建观察基线。 |
+| `EVENTS_MAX_BYTES` | 当前字节预算装不下一条事件。 |
+| `EVENTS_LEASE_EXPIRED` | 租约到期，需重新订阅。 |
+| `EVENTS_TARGET_GONE` | 目标窗口已经关闭或 HWND 所属进程改变。 |
+| `EVENTS_UNSUBSCRIBED` | 已主动取消。 |
+| `EVENTS_CLEANUP_FAILED` | 显式取消时至少一个处理器摘除失败。 |
+
+租约从订阅成功前设定的时点起计算，读取不续租。租约到期、目标丢失和服务退出都会尝试清理 UIA 处理器。没有查询 ID 的 `status` 只展示活跃订阅。
+
 
 ## 版本规则
 
