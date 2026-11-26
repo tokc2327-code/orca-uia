@@ -2,7 +2,7 @@
 
 # orca-uia
 
-**0.5.0**
+**0.6.0**
 
 **面向 AI agent 的 Windows UI Automation MCP 服务:优先用 Pattern,默认不碰鼠标键盘。**
 
