@@ -10,7 +10,7 @@ Operate Win32, WPF, Electron, and UWP desktop apps via structured control trees 
 
 [![.NET 8](https://img.shields.io/badge/.NET-8.0%20Windows-512BD4.svg)](#quick-start)
 [![UIA3](https://img.shields.io/badge/Windows-UIA3%20%2F%20FlaUI%205.0-0078D6.svg)](#architecture--known-boundaries)
-[![Protocol](https://img.shields.io/badge/MCP-stdio%20JSON--RPC%202.0-brightgreen.svg)](#tools-9)
+[![Protocol](https://img.shields.io/badge/MCP-stdio%20JSON--RPC%202.0-brightgreen.svg)](#tools-10)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#license)
 
 ---
@@ -79,7 +79,7 @@ Register the executable as a stdio MCP server:
 
 ---
 
-## Tools (9)
+## Tools (10)
 
 | Tool | Purpose | Key Parameters |
 | --- | --- | --- |
@@ -88,8 +88,9 @@ Register the executable as a stdio MCP server:
 | `app_warmup` | Poll descendant node count until a lazily-built Electron/Chromium AX tree stabilizes | `min_nodes`, `timeout_ms` |
 | `app_window` | List, show, hide, or focus top-level `HWND`s — including hidden/tray windows invisible to UIA | `action` (`list\|show\|hide\|focus`), `pid`, `title_contains`, `class_contains` |
 | `app_cdp` | Drive Chromium/Electron `contenteditable` editors & DOM directly via DevTools Protocol (zero OS input) | `action` (`targets\|eval\|focus\|insert_text\|clear\|click\|wait_for\|key`), `port`, `selector`, `text` |
-| `app_snapshot` | Dump the visible control tree as compact text with snapshot-scoped IDs (`e1`, `e2`...) and state flags | `interactive_only`, `max_nodes` |
-| `app_act` | Execute a single action or a multi-step `steps[]` sequence by snapshot ID or live selector, returning post-state & diff | `id` or `target`, `action` (`click\|set_value\|type\|press\|toggle`), `input` (`pattern\|physical`), `steps[]`, `changes` |
+| `app_snapshot` | Dump the visible control tree as compact text with snapshot-scoped IDs (`e1`, `e2`...) and state flags. Optional `since` (an event cursor) returns a JSON delta of appeared, gone, and property changes instead of that text | `interactive_only`, `max_nodes`, `since` |
+| `app_events` | Subscribe to window-scoped UIA events, then poll a cursor, inspect status, or unsubscribe (at most 4 active leases) | `action` (`subscribe\|poll\|status\|unsubscribe`), `window`, `kinds`, `subscription_id`, `since` |
+| `app_act` | Execute a single action or a multi-step `steps[]` sequence by snapshot ID or live selector, returning post-state & diff. `set_value` takes optional `unit` (`auto` / `native` / `percent`) and checks trackbar writes against the control's own position | `id` or `target`, `action` (`click\|set_value\|type\|press\|toggle`), `input` (`pattern\|physical`), `unit`, `steps[]`, `changes` |
 | `app_wait` | Wait until an element whose name contains a substring appears or disappears | `name_contains`, `state` (`appear\|gone`), `timeout_ms` |
 | `app_shot` | Capture a PNG of a single window (`PrintWindow` with `PW_RENDERFULLCONTENT`) for vision fallback | `path`, `title_contains`, `pid` |
 
@@ -156,7 +157,8 @@ One trap in the setup: if the driven window happens to be in front when the sent
 ## Architecture & Known Boundaries
 
 - **Single STA Thread + Message Pump:** `Program.cs` reads `stdin` on a dedicated reader thread and dispatches all UIA3/COM calls on one STA worker thread with an explicit Win32 `PeekMessage`/`DispatchMessage` pump, preventing cross-apartment COM timeouts.
-- **Structured Errors:** Failures return `{ "error": "<CODE>", "message": "...", "hint": "..." }` (`NOT_FOUND`, `AMBIGUOUS_MATCH`, `UNKNOWN_ID`, `NO_VALUE_PATTERN`, `CDP_UNAVAILABLE`, etc.) so agents can self-correct deterministically.
+- **Structured Errors:** Failures return `{ "error": "<CODE>", "message": "...", "hint": "..." }` (`NOT_FOUND`, `AMBIGUOUS_MATCH`, `UNKNOWN_ID`, `UNSUPPORTED_PATTERN`, `CDP_UNAVAILABLE`, etc.) so agents can self-correct deterministically. Event subscriptions add `EVENTS_BUSY`, `EVENTS_UNKNOWN_SUBSCRIPTION`, `EVENTS_BAD_CURSOR`, `EVENTS_CURSOR_STALE`, `EVENTS_MAX_BYTES`, `EVENTS_LEASE_EXPIRED`, `EVENTS_TARGET_GONE`, `EVENTS_UNSUBSCRIBED`, and `EVENTS_CLEANUP_FAILED`.
+- **`set_value` ground truth:** `unit` is `auto` (default, treated as `native`), `native` (the control's own Min..Max), or `percent` (0..100). Any other value is `BAD_ARGS`. A Win32 trackbar's ValuePattern speaks percent, so a native write is converted from the control's range and checked with `TBM_GETPOS`. A miss is `VALUE_READBACK_MISMATCH`, a value outside the range is `VALUE_OUT_OF_RANGE`, and a degenerate trackbar range (`Max <= Min`) on a slider-like control, or numeric `unit="native"` on a percent-only slider with no readable position and no RangeValuePattern, is `NO_GROUND_TRUTH`.
 - **Snapshot IDs are scoped to the latest snapshot.** They are re-resolved server-side, but a new snapshot restarts numbering at `e1`: an old ID that happens to name an existing entry will resolve to the *new* entry with that number. Discard IDs after a snapshot, or use a live selector (`{type, name, name_contains, aid}`).
 - **Known Windows Boundaries:**
   - **UIPI:** A Medium-IL `orca-uia` process cannot control elevated (Administrator) windows without `uiAccess` signing. The failure looks like an empty tree, not an error.
@@ -173,7 +175,7 @@ One trap in the setup: if the driven window happens to be in front when the sent
 
 ### Verified
 
-- [x] 9 core MCP tools over stdio JSON-RPC 2.0 (STA + Win32 message pump)
+- [x] 10 core MCP tools over stdio JSON-RPC 2.0 (STA + Win32 message pump)
 - [x] Multi-step `steps[]` live-selector execution with tree diff & readback warnings
 - [x] Built-in `app_cdp` & `app_window` for Electron and tray apps
 - [x] `foreground_policy` guard (`forbid` / `allow_on_idle` / `allow`) plus non-activating launch/show — `WS_EX_NOACTIVATE`, `SW_SHOWNOACTIVATE`
@@ -185,7 +187,7 @@ One trap in the setup: if the driven window happens to be in front when the sent
 Deliberately not done. These are boundaries, not a backlog:
 
 - **No per-application compatibility work.** No "make it work on app X" patches, no vendor-specific quirks. Apps where the tree is empty, stale, or silent stay that way.
-- **No full UIA surface.** Nine tools, not a wrapper around every pattern.
+- **No full UIA surface.** Ten tools, not a wrapper around every pattern.
 - **No elevated targets.** UIPI blocks a Medium-IL process from driving Administrator windows; `uiAccess` signing is out of scope.
 - **No shadow desktop.** `CreateDesktop` isolation, virtual displays and invisible Electron hosting are not planned here.
 - **No CI acceptance gate.** The sentinel needs an interactive desktop session; it stays a manual step.

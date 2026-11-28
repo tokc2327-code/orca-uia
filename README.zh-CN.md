@@ -10,7 +10,7 @@
 
 [![.NET 8](https://img.shields.io/badge/.NET-8.0%20Windows-512BD4.svg)](#快速开始)
 [![UIA3](https://img.shields.io/badge/Windows-UIA3%20%2F%20FlaUI%205.0-0078D6.svg)](#架构与已知边界)
-[![Protocol](https://img.shields.io/badge/MCP-stdio%20JSON--RPC%202.0-brightgreen.svg)](#工具9-个)
+[![Protocol](https://img.shields.io/badge/MCP-stdio%20JSON--RPC%202.0-brightgreen.svg)](#工具10-个)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](#许可证)
 
 ---
@@ -80,7 +80,7 @@ dotnet publish src/OrcaUia.csproj -c Release -r win-x64
 
 ---
 
-## 工具(9 个)
+## 工具(10 个)
 
 | 工具 | 作用 | 关键参数 |
 | --- | --- | --- |
@@ -89,8 +89,9 @@ dotnet publish src/OrcaUia.csproj -c Release -r win-x64
 | `app_warmup` | 轮询后代节点数直到稳定——Electron 树是懒构建的,这通常就是空树的解法 | `min_nodes`、`timeout_ms` |
 | `app_window` | 列出 / 显示 / 隐藏 / 聚焦顶层 `HWND`,包括 UIA 看不见的隐藏窗口和托盘窗口 | `action`(`list\|show\|hide\|focus`)、`pid`、`title_contains`、`class_contains` |
 | `app_cdp` | 用 DevTools 协议直接驱动 Chromium/Electron 的 `contenteditable` 与 DOM(零系统输入) | `action`(`targets\|eval\|focus\|insert_text\|clear\|click\|wait_for\|key`)、`port`、`selector`、`text` |
-| `app_snapshot` | 把可见控件树导成紧凑文本,带快照作用域的 ID(`e1`、`e2`…)和状态标记 | `interactive_only`、`max_nodes` |
-| `app_act` | 按快照 ID 或实时选择器执行单步动作或多步 `steps[]` 序列,返回动作后状态与差异 | `id` 或 `target`、`action`(`click\|set_value\|type\|press\|toggle`)、`input`(`pattern\|physical`)、`steps[]`、`changes` |
+| `app_snapshot` | 把可见控件树导成紧凑文本,带快照作用域的 ID(`e1`、`e2`…)和状态标记。可选 `since`(事件游标)改为返回 JSON 增量,只含出现、消失和属性变化 | `interactive_only`、`max_nodes`、`since` |
+| `app_events` | 订阅窗口作用域的 UIA 事件,再按游标拉取、查看状态或退订(最多 4 个活跃订阅) | `action`(`subscribe\|poll\|status\|unsubscribe`)、`window`、`kinds`、`subscription_id`、`since` |
+| `app_act` | 按快照 ID 或实时选择器执行单步动作或多步 `steps[]` 序列,返回动作后状态与差异。`set_value` 可带 `unit`(`auto` / `native` / `percent`),TrackBar 写入会用控件自己的位置核对 | `id` 或 `target`、`action`(`click\|set_value\|type\|press\|toggle`)、`input`(`pattern\|physical`)、`unit`、`steps[]`、`changes` |
 | `app_wait` | 等一个名字含某子串的元素出现或消失 | `name_contains`、`state`(`appear\|gone`)、`timeout_ms` |
 | `app_shot` | 用 `PrintWindow`(`PW_RENDERFULLCONTENT`)把单个窗口存成 PNG,给看得懂图的客户端兜底 | `path`、`title_contains`、`pid` |
 
@@ -157,7 +158,8 @@ pwsh -File tests\foreground-sentinel.ps1 `
 ## 架构与已知边界
 
 - **单条 STA 线程 + 消息泵**:`Program.cs` 用一条专用读线程读 `stdin`,所有 UIA3/COM 调用都投递到同一条 STA 工作线程,并显式跑 Win32 的 `PeekMessage`/`DispatchMessage` 泵,避免跨单元 COM 超时。
-- **结构化错误**:失败返回 `{ "error": "<CODE>", "message": "...", "hint": "..." }`(`NOT_FOUND`、`AMBIGUOUS_MATCH`、`UNKNOWN_ID`、`NO_VALUE_PATTERN`、`CDP_UNAVAILABLE` 等),agent 可以确定性地自我纠正。
+- **结构化错误**:失败返回 `{ "error": "<CODE>", "message": "...", "hint": "..." }`(`NOT_FOUND`、`AMBIGUOUS_MATCH`、`UNKNOWN_ID`、`UNSUPPORTED_PATTERN`、`CDP_UNAVAILABLE` 等),agent 可以确定性地自我纠正。事件订阅另有 `EVENTS_BUSY`、`EVENTS_UNKNOWN_SUBSCRIPTION`、`EVENTS_BAD_CURSOR`、`EVENTS_CURSOR_STALE`、`EVENTS_MAX_BYTES`、`EVENTS_LEASE_EXPIRED`、`EVENTS_TARGET_GONE`、`EVENTS_UNSUBSCRIBED`、`EVENTS_CLEANUP_FAILED`。
+- **`set_value` 的地面真值**:`unit` 取 `auto`(默认,按 `native` 处理)、`native`(控件自己的 Min..Max)或 `percent`(0..100),其他值报 `BAD_ARGS`。Win32 TrackBar 的 ValuePattern 讲的是百分比,所以 native 写入会先按控件范围换算,再用 `TBM_GETPOS` 核对真值。对不上报 `VALUE_READBACK_MISMATCH`,超出范围报 `VALUE_OUT_OF_RANGE`;TrackBar 范围退化(`Max <= Min`)且控件像 Slider 或 Spin,或在只讲百分比、没有可读位置、也没有 RangeValuePattern 的滑杆上用数字要求 `unit="native"`,报 `NO_GROUND_TRUTH`。
 - **快照 ID 只在最新一份快照里有效。** 服务端会重解析,但新快照会从 `e1` 重新编号:一个旧 ID 如果恰好撞上当前存在的编号,会解析到**新**条目。拍完新快照就丢掉旧 ID,或者用实时选择器(`{type, name, name_contains, aid}`)。
 - **Windows 侧的已知边界:**
   - **UIPI**:中等完整性级别的 `orca-uia` 进程无法操作提权的(管理员)窗口,除非做 `uiAccess` 签名。失败表现为空树,而不是报错。
@@ -174,7 +176,7 @@ pwsh -File tests\foreground-sentinel.ps1 `
 
 ### 已验证
 
-- [x] stdio JSON-RPC 2.0 上的 9 个核心 MCP 工具(STA + Win32 消息泵)
+- [x] stdio JSON-RPC 2.0 上的 10 个核心 MCP 工具(STA + Win32 消息泵)
 - [x] `steps[]` 多步实时选择器执行,带控件树差异与回读告警
 - [x] 内置 `app_cdp` 与 `app_window`,覆盖 Electron 和托盘应用
 - [x] `foreground_policy` 三档(`forbid` / `allow_on_idle` / `allow`)+ 不激活的启动与显示——`WS_EX_NOACTIVATE`、`SW_SHOWNOACTIVATE`
@@ -186,7 +188,7 @@ pwsh -File tests\foreground-sentinel.ps1 `
 这些都是**边界,不是待办**:
 
 - **不做按软件逐个适配。** 没有「让它在某某应用上跑通」的补丁,不追第三方改版。控件树为空、过期、或者动作静默不生效的应用,就保持那样。
-- **不做全量 UIA 封装。** 九个工具,不是一个把所有 Pattern 都包一遍的库。
+- **不做全量 UIA 封装。** 十个工具,不是一个把所有 Pattern 都包一遍的库。
 - **不支持提权窗口。** 中等完整性级别进程驱动不了管理员窗口,`uiAccess` 签名不在范围内。
 - **不做影子桌面。** `CreateDesktop` 隔离、虚拟显示器、不可见 Electron 托管,这里都不打算做。
 - **不把哨兵做成 CI 门。** 它要一个交互式桌面会话,只能是手工一步。

@@ -4,7 +4,7 @@
 
 服务器通过标准输入和标准输出传输 JSON-RPC 2.0。每行一条 UTF-8 JSON 消息，输出无 BOM。客户端发送带 `id` 的 `initialize`，然后发送无 `id` 的 `notifications/initialized`，服务端对通知不回复。实测请求 `2025-03-26` 返回 `2025-03-26`，省略该字段也返回这个值。当前实现原样回显客户端提供的版本字符串，未校验支持范围。`initialize` 返回 `protocolVersion`、`capabilities: {"tools":{}}` 和 `serverInfo: {"name":"orca-uia","version":"0.6.0"}`。
 
-`tools/list` 返回 `{"tools":[{"name":…,"description":…,"inputSchema":…},…]}`。`tools/call` 接收 `params.name` 和 `params.arguments`。工具结果为 `{"content":[{"type":"text","text":…}],"isError":false}`。下表中的对象都是 **`text` 内编码的 JSON**。`app_snapshot` 和多步 `app_act` 使用下述文本格式。
+`tools/list` 返回 `{"tools":[{"name":…,"description":…,"inputSchema":…},…]}`。`tools/call` 接收 `params.name` 和 `params.arguments`。工具结果为 `{"content":[{"type":"text","text":…}],"isError":false}`。下表中的对象都是 **`text` 内编码的 JSON**。`app_snapshot`（不带 `since`）和多步 `app_act` 使用下述文本格式。
 
 未知 JSON-RPC 方法返回顶层 `error.code = -32601`。请求处理中的其他异常可返回 `-32603`。工具失败返回 `isError: true`，`text` 内为 `{error, message, hint}`（`hint` 可为 null），未分类的工具异常为 `{error:"INTERNAL", message}`。多步动作的单步失败写入该步结果，正常完成外层调用时仍为 `isError: false`。
 
@@ -19,20 +19,21 @@
 | `app_warmup` | 无 | `min_nodes`、`timeout_ms`（整数） | `{cold_nodes, stable_nodes, elapsed_ms, ready}`。`ready` 表示最终节点数达到 `min_nodes`。 |
 | `app_window` | 无 | `action`、`title_contains`、`class_contains`、`foreground_policy`（字符串），`pid`、`settle_ms`（整数） | `list` 返回 `{count, windows:[{hwnd,title,klass,pid,visible,rect}]}`。其他动作返回 `{ok,action,hwnd,title,klass,pid,was_visible,visible_now,rect,hint}`。 |
 | `app_cdp` | 无 | `action`、`text`、`selector`、`expression`、`key`、`url_contains`、`title_contains`（字符串），`port`、`timeout_ms`（整数），`clear_first`（布尔） | 按动作分别返回，见下表。 |
-| `app_snapshot` | 无 | `interactive_only`（布尔），`max_nodes`（整数） | 缩进文本树，带节点数和耗时表头。节点行包含 ID、控件类型、名称、可选 AutomationId 和状态、矩形 `(x,y,width,height)`。 |
-| `app_act` | 无 | `id`、`input`、`type`、`name`、`name_contains`、`aid`、`action`、`text`、`foreground_policy`（字符串），`target`（对象），`steps`（数组），`index`、`idle_ms`、`settle_ms`（整数），`changes`、`stop_on_error`（布尔） | 单步 `{ok,action,input,used,state,elapsed_ms}`，可带 `warning` 和 `changed`。多步返回摘要行和逐步 JSON。 |
+| `app_snapshot` | 无 | `interactive_only`（布尔），`max_nodes`（整数），`since`（字符串） | 不带 `since` 时为缩进文本树，带节点数和耗时表头。节点行包含 ID、控件类型、名称、可选 AutomationId 和状态、矩形 `(x,y,width,height)`。带 `since` 时为 JSON `{changes, cursor, unmatched, has_more}`，见下文。 |
+| `app_events` | `action`（字符串） | `window`（对象），`kinds`（数组），`debounce_ms`、`lease_s`、`limit`、`max_bytes`（整数），`subscription_id`、`since`（字符串） | 按 `subscribe`、`poll`、`status`、`unsubscribe` 分别返回，见「V0.6 事件订阅与快照增量」。 |
+| `app_act` | 无 | `id`、`input`、`type`、`name`、`name_contains`、`aid`、`action`、`text`、`unit`、`foreground_policy`（字符串），`target`（对象），`steps`（数组），`index`、`idle_ms`、`settle_ms`（整数），`changes`、`stop_on_error`（布尔） | 单步 `{ok,action,input,used,state,elapsed_ms}`，可带 `warning`、`changed`，以及 `set_value` 的 `unit` 真值字段。多步返回摘要行和逐步 JSON。 |
 | `app_wait` | `name_contains`（字符串） | `state`（字符串），`timeout_ms`（整数） | `{ok,state,elapsed_ms}`。 |
 | `app_shot` | `path`（字符串） | `title_contains`（字符串），`pid`（整数） | `{ok,path,width,height,title,pid,visible,method:"printwindow"}`。`path` 是写入的 PNG 的绝对路径。 |
 
 - `app_launch` 默认等待窗口 30000 ms，预加载预算为 1500 ms，已知 Chromium/Electron 程序默认加无障碍启动标志。schema 描述提到了 `preload=false`，当前 `app_launch` 始终执行预加载，`app_attach` 才读取该布尔字段。两者都额外读取 schema 未声明的 `foreground_policy`。默认尝试为窗口设置 `WS_EX_NOACTIVATE`，传 `allow` 会跳过。
-- `app_attach` 运行时至少需要 `title_contains` 或 `pid`，默认 `preload=true`、`preload_ms=1500`。附加或启动成功后清除上次快照 ID。`app_warmup`、`app_snapshot`、`app_wait` 和元素操作需要已附加的窗口。
+- `app_attach` 运行时至少需要 `title_contains` 或 `pid`，默认 `preload=true`、`preload_ms=1500`。附加或启动成功后清除上次快照 ID。`app_warmup`、不带 `since` 的 `app_snapshot`、`app_wait` 和元素操作需要已附加的窗口。带 `since` 的增量只认事件游标，不要求当前附加。
 - `app_warmup` 默认 `min_nodes=200`、`timeout_ms=25000`。`app_snapshot` 默认 `interactive_only=true`、`max_nodes=600`。`app_wait` 默认 `state="appear"` 和 5000 ms，使用不区分大小写的名称子串。传 `gone` 等待消失。
 - `app_window` 支持 `list`（默认）、`show`、`hide`、`focus`，包括隐藏窗口。按窗口面积降序排列，`list` 最多给 20 条明细，`count` 为全部匹配数，其他动作选首项。矩形是 `[x,y,width,height]`，`hwnd` 是十六进制字符串。默认 `settle_ms=400`，`show` 仅在 `foreground_policy="allow"` 时尝试激活，`focus` 受前台策略约束。
 - `app_shot` 优先选择可见且面积较大的匹配窗口，使用 `PrintWindow` 保存 PNG。渲染失败返回 `SHOT_FAILED`，不会从屏幕复制覆盖窗口的像素。
 
 ### `app_act` 单步与多步
 
-单步须传 `action`（`click`、`set_value`、`type`、`press`、`toggle`）和目标。目标用当前 `id` 或实时选择器，至少给 `type`、`name`、`name_contains`、`aid` 之一。可用嵌套 `target` 或同名顶层字段，运行时也识别 `automation_id` 作为 `aid` 的别名，以及 `anchor` 作为最近有名称的祖先过滤项（多个候选时）。`index` 为从 0 开始的匹配序号，省略时要求唯一匹配。名称和 AutomationId 精确匹配区分大小写，名称子串匹配忽略大小写。`set_value`、`type` 和 `press` 需要 `text`。`press` 还需要 `input="physical"`，`text` 为虚拟键名。
+单步须传 `action`（`click`、`set_value`、`type`、`press`、`toggle`）和目标。目标用当前 `id` 或实时选择器，至少给 `type`、`name`、`name_contains`、`aid` 之一。可用嵌套 `target` 或同名顶层字段，运行时也识别 `automation_id` 作为 `aid` 的别名，以及 `anchor` 作为最近有名称的祖先过滤项（多个候选时）。`index` 为从 0 开始的匹配序号，省略时要求唯一匹配。名称和 AutomationId 精确匹配区分大小写，名称子串匹配忽略大小写。`set_value`、`type` 和 `press` 需要 `text`。`set_value` 还可带 `unit`（`auto`、`native`、`percent`，默认 `auto`），见文末。`press` 还需要 `input="physical"`，`text` 为虚拟键名。
 
 非空 `steps` 进入多步模式。每步有 `action` 及其参数，`action="wait"` 使用 `app_wait` 的参数。默认 `input="pattern"`、`settle_ms=150`、`foreground_policy="forbid"`。`allow_on_idle` 默认需要 3000 ms 空闲。`changes` 在单步默认关闭，在多步默认启用。`stop_on_error` 默认启用。多步文本以 `# steps ok=成功数/总数 done=执行数 elapsed_ms=耗时` 开头，每步一条 JSON，`i` 从 1 开始。动作成功行含 `i, action, input, used, ok, target, state, elapsed_ms`，可带 `warning` 和 `changed`。等待成功行含 `i, action, ok, result, elapsed_ms`。失败行含 `i, action, ok:false, error, message, hint, elapsed_ms`。
 
@@ -55,7 +56,7 @@
 
 ## 元素 ID 作用域
 
-`e1, e2, …` 表示当前进程最新一次快照中的元素查找条件。每次 `app_snapshot` 都清空旧映射并从 `e1` 开始编号。客户端必须在下一次快照时丢弃整批旧 ID。当前表中没有的 ID 返回 `UNKNOWN_ID`。由于字符串会在下一次快照重复分配，服务器无法区分同名的旧 ID 和新 ID，收到当前表中已有的字符串会解析当前条目。若当前条目在实时树中找不到候选则返回 `NOT_FOUND`，有多个候选则返回 `AMBIGUOUS_MATCH`。需要跨快照定位时使用实时选择器。
+`e1, e2, …` 表示当前进程最新一次快照中的元素查找条件。每次不带 `since` 的 `app_snapshot` 都清空旧映射并从 `e1` 开始编号。带 `since` 的增量不重建这张表。客户端必须在下一次完整快照时丢弃整批旧 ID。当前表中没有的 ID 返回 `UNKNOWN_ID`。由于字符串会在下一次快照重复分配，服务器无法区分同名的旧 ID 和新 ID，收到当前表中已有的字符串会解析当前条目。若当前条目在实时树中找不到候选则返回 `NOT_FOUND`，有多个候选则返回 `AMBIGUOUS_MATCH`。需要跨快照定位时使用实时选择器。
 
 ## 错误码
 
@@ -73,11 +74,11 @@
 | `LAUNCH_HANDED_OFF` | 启动器先退出，且调用未传标题来继续寻找窗口。 |
 | `PASSWORD_FIELD` | 密码控件上的模式输入 `type` 需要真实按键。 |
 | `PHYSICAL_ONLY` | `press` 需要 `input="physical"`。 |
-| `NO_PATTERN_TYPING` | 当前控件没有可用于追加文本的 Value 模式或原生输入路径。 |
-| `NO_VALUE_PATTERN` | 当前控件没有可用于设置文本的 Value 模式或原生输入路径。 |
 | `NO_TOGGLE` | 控件既不支持 Toggle，也不支持 SelectionItem。 |
+| `UNSUPPORTED_PATTERN` | `set_value` 没有可写的 ValuePattern 或 RangeValuePattern，或 `type` 没有可写的 ValuePattern。0.6.0 起不再返回 `NO_VALUE_PATTERN` 与 `NO_PATTERN_TYPING`。 |
 | `VALUE_OUT_OF_RANGE` | `set_value` 的请求值超出控件自己的范围。消息带请求值、控件真值和换算后的百分比。 |
-| `NO_GROUND_TRUTH` | 要求 `unit="native"`，但该滑杆只讲百分比，又没有可读的控件真值来确认结果。 |
+| `VALUE_READBACK_MISMATCH` | `set_value` 或 `type` 写完后，ValuePattern、RangeValuePattern 的回读，或 TrackBar 的 `TBM_GETPOS`，与请求值不符。 |
+| `NO_GROUND_TRUTH` | `set_value`：TrackBar 范围退化（`Max <= Min`）且控件类型像 Slider 或 Spin；或显式 `unit="native"`、文本为数字、控件像滑杆、只讲百分比、没有可读 TrackBar 位置、也没有 RangeValuePattern。 |
 | `USER_ACTIVE` | `allow_on_idle` 的空闲时间门槛尚未达到。 |
 | `FOREGROUND_FORBIDDEN` | 前台策略禁止这次需要接管前台的动作。 |
 | `SHOT_FAILED` | `PrintWindow` 没能渲染目标窗口。 |
@@ -126,7 +127,7 @@
 租约从订阅成功前设定的时点起计算，读取不续租。租约到期、目标丢失和服务退出都会尝试清理 UIA 处理器。没有查询 ID 的 `status` 只展示活跃订阅。
 
 
-## `app_act` 的 `unit` 参数（0.7.0 起）
+## `app_act` 的 `unit` 参数（0.6.0 起）
 
 `action="set_value"` 可以带可选参数 `unit`，取值 `"auto"`（默认）| `"native"` | `"percent"`，其他值报 `BAD_ARGS`。
 

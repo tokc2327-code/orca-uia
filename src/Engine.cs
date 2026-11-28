@@ -1691,7 +1691,7 @@ public static class Tools
                 ["index"] = I("0-based pick when several elements match; omit to require a unique match"),
                 ["action"] = S("click|set_value|type|press|toggle (single-step form)"),
                 ["text"] = S("value / text / key name"),
-                ["unit"] = S("set_value only: auto (default) | native (the control's own Min..Max) | percent (0..100). Common-control trackbars (msctls_trackbar32) answer ValuePattern in percent, so auto treats them as percent and verifies against TBM_GETPOS; the receipt then carries unit/requested/applied/applied_verified/native_value/native_min/native_max"),
+                ["unit"] = S("set_value only: auto (default, same as native) | native (the control's own Min..Max) | percent (0..100). Common-control trackbars (msctls_trackbar32) answer ValuePattern in percent, so auto is native: the caller's value is converted from the control's Min..Max and verified against TBM_GETPOS; the receipt then carries unit/requested/applied/applied_verified/native_value/native_min/native_max"),
                 ["steps"] = new JsonObject { ["type"] = "array", ["description"] = "sequence: [{action|wait, id|target|type|name|name_contains|aid|index, text, settle_ms}]" },
                 ["changes"] = B("report appeared/removed/enabled-changed nodes; default true for steps, false for a single act"),
                 ["stop_on_error"] = B("stop the sequence at the first failed step; default true"),
